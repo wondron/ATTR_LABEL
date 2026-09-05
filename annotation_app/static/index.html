@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>食物图像多属性标注台</title>
+  <link rel="stylesheet" href="/static/styles.css?v=linux-realtime-stats-2">
+  <link rel="stylesheet" href="/static/directory-browser.css?v=linux-realtime-stats-2">
+</head>
+<body>
+  <a class="skip-link" href="#annotationForm">跳到标注表单</a>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="食物图像多属性标注台">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span class="brand-copy">
+          <strong>多属性标注台</strong>
+          <small id="rootPath">正在连接数据目录…</small>
+        </span>
+      </div>
+
+      <div class="topbar-stats" aria-label="标注统计">
+        <span class="stat-pill"><b id="totalCount">0</b><small>全部</small></span>
+        <span class="stat-pill stat-pill--success"><b id="labeledCount">0</b><small>已标注</small></span>
+        <span class="stat-pill stat-pill--warning"><b id="unlabeledCount">0</b><small>未标注</small></span>
+        <span class="stat-pill stat-pill--danger" id="invalidStat"><b id="invalidCount">0</b><small>异常</small></span>
+      </div>
+
+      <div class="topbar-actions">
+        <button type="button" class="button button--secondary button--compact statistics-button" id="openStatisticsButton" aria-haspopup="dialog" aria-controls="statisticsDialog" aria-busy="true" title="正在连接数据目录…" disabled>
+          <span class="statistics-button-icon" aria-hidden="true"></span>
+          <span>属性统计</span>
+        </button>
+        <button type="button" class="button button--subtle button--compact folder-picker-button" id="chooseDataDirButton" aria-describedby="rootPath folderSwitchStatus" aria-busy="false" title="浏览 Linux 服务器上的标注数据目录">
+          <span id="chooseDataDirButtonText">切换文件夹</span>
+        </button>
+        <span class="sr-only" id="folderSwitchStatus" role="status" aria-live="polite"></span>
+        <span class="service-status" id="serviceStatus" role="status">
+          <i aria-hidden="true"></i><span>连接中</span>
+        </span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="image-sidebar" aria-label="图像列表">
+        <div class="sidebar-heading">
+          <div>
+            <span class="eyebrow">数据集</span>
+            <h1>待标注图像</h1>
+          </div>
+          <span class="visible-count" id="visibleCount">0 张</span>
+        </div>
+
+        <div class="list-tools">
+          <label class="search-box" for="imageSearch">
+            <span aria-hidden="true"></span>
+            <input id="imageSearch" type="search" placeholder="搜索文件名" autocomplete="off">
+          </label>
+          <label class="filter-label" for="statusFilter">
+            <span class="sr-only">按标注状态筛选</span>
+            <select id="statusFilter">
+              <option value="all">全部状态</option>
+              <option value="unlabeled">仅未标注</option>
+              <option value="labeled">仅已标注</option>
+              <option value="invalid">仅异常</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="image-list" id="imageList" role="listbox" aria-label="图像文件">
+          <div class="list-placeholder" id="listPlaceholder">
+            <span class="spinner" aria-hidden="true"></span>
+            <p>正在读取图像列表…</p>
+          </div>
+        </div>
+      </aside>
+
+      <section class="viewer-panel" aria-label="图像预览">
+        <div class="viewer-header">
+          <div class="current-file">
+            <span class="eyebrow">当前图像</span>
+            <strong id="currentFileName">尚未选择图像</strong>
+          </div>
+          <div class="viewer-header-meta">
+            <span id="positionText">0 / 0</span>
+            <span class="annotation-state annotation-state--idle" id="annotationState">等待选择</span>
+          </div>
+        </div>
+
+        <div class="image-stage" id="imageStage">
+          <div class="empty-view" id="emptyView">
+            <div class="empty-view-mark" aria-hidden="true"><span></span></div>
+            <strong>从左侧选择一张图像</strong>
+            <p>查看图片并编辑右侧的 8 项属性</p>
+          </div>
+          <div class="viewer-loading hidden" id="viewerLoading" aria-live="polite">
+            <span class="spinner spinner--light" aria-hidden="true"></span>
+            <span>正在加载图像…</span>
+          </div>
+          <img id="previewImage" alt="" draggable="false" hidden>
+          <div class="image-error hidden" id="imageError" role="alert">
+            <strong>图像加载失败</strong>
+            <span>请检查文件是否仍然存在</span>
+          </div>
+
+          <div class="zoom-toolbar" id="zoomToolbar" hidden>
+            <button type="button" id="zoomOutButton" aria-label="缩小图像" title="缩小">−</button>
+            <span id="zoomText">适应</span>
+            <button type="button" id="zoomInButton" aria-label="放大图像" title="放大">＋</button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button type="button" class="fit-button" id="fitButton" title="恢复适应窗口（Esc）">适应</button>
+          </div>
+        </div>
+
+        <div class="viewer-footer">
+          <button type="button" class="button button--ghost" id="previousButton" disabled>
+            <span aria-hidden="true">←</span> 上一张
+          </button>
+          <div class="shortcut-hint">Q 上一张 · W 下一张</div>
+          <button type="button" class="button button--ghost" id="nextButton" disabled>
+            下一张 <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      </section>
+
+      <aside class="annotation-panel" aria-label="属性标注">
+        <div class="annotation-header">
+          <div class="annotation-heading">
+            <span class="eyebrow">标注内容</span>
+            <h2>八项属性</h2>
+            <p class="annotation-contract">空白数值保存为 null · 多选默认“无”</p>
+          </div>
+          <span class="schema-version" id="annotationVersionBadge">JSON v1.6</span>
+        </div>
+
+        <div class="status-banner" id="statusBanner" role="status" aria-live="polite">
+          <span class="status-banner-icon" aria-hidden="true"></span>
+          <div>
+            <strong id="statusBannerTitle">等待选择</strong>
+            <p id="statusBannerText">选择图像后开始标注。</p>
+          </div>
+        </div>
+
+        <form id="annotationForm" novalidate>
+          <fieldset id="annotationFields" disabled>
+            <div class="field-grid field-grid--identity">
+              <label class="field" for="foodNameInput">
+                <span class="field-label">
+                  <span class="field-name"><b>食物名称</b><code>food_name</code></span>
+                  <span class="json-type" data-json-type="food_name" title="默认 &quot;无&quot;">string</span>
+                </span>
+                <input id="foodNameInput" name="food_name" type="text" value="无" placeholder="例如：蛋挞" autocomplete="off" aria-describedby="foodNameHelp foodNameError">
+                <small class="field-help field-help--sr-only" id="foodNameHelp">默认 <code data-json-default="food_name">"无"</code></small>
+                <small class="field-error" id="foodNameError"></small>
+              </label>
+
+              <label class="field" for="deviceModelSelect">
+                <span class="field-label">
+                  <span class="field-name"><b>设备型号</b><code>device_model</code></span>
+                  <span class="json-type" data-json-type="device_model" title="默认 null">string | null</span>
+                </span>
+                <select id="deviceModelSelect" name="device_model" aria-describedby="deviceModelHelp deviceModelError">
+                  <option value="">未指定（null）</option>
+                </select>
+                <small class="field-help field-help--sr-only" id="deviceModelHelp">默认 <code data-json-default="device_model">null</code></small>
+                <small class="field-error" id="deviceModelError"></small>
+              </label>
+            </div>
+
+            <div class="field-grid field-grid--numbers">
+              <label class="field" for="foodCountInput">
+                <span class="field-label">
+                  <span class="field-name"><b>食物数量</b><code>food_count</code></span>
+                  <span class="json-type" data-json-type="food_count" title="默认 null">int | null</span>
+                </span>
+                <input id="foodCountInput" name="food_count" type="number" min="0" step="1" inputmode="numeric" placeholder="整数" autocomplete="off" aria-describedby="foodCountHelp foodCountError">
+                <small class="field-help field-help--sr-only" id="foodCountHelp">仅整数；默认 <code data-json-default="food_count">null</code></small>
+                <small class="field-error" id="foodCountError"></small>
+              </label>
+
+              <label class="field" for="qualityInput">
+                <span class="field-label">
+                  <span class="field-name"><b>总重量（g）</b><code>quality</code></span>
+                  <span class="json-type" data-json-type="quality" title="默认 null">float | null</span>
+                </span>
+                <input id="qualityInput" name="quality" type="number" step="any" inputmode="decimal" placeholder="整数或小数" autocomplete="off" aria-describedby="qualityHelp qualityError">
+                <small class="field-help field-help--sr-only" id="qualityHelp">保存为浮点数；默认 <code data-json-default="quality">null</code></small>
+                <small class="field-error" id="qualityError"></small>
+              </label>
+
+              <label class="field" for="foodSizeInput">
+                <span class="field-label">
+                  <span class="field-name"><b>食物尺寸</b><code>food_size</code></span>
+                  <span class="json-type" data-json-type="food_size" title="默认 null">int | null</span>
+                </span>
+                <input id="foodSizeInput" name="food_size" type="number" min="1" step="1" inputmode="numeric" placeholder="正整数" autocomplete="off" aria-describedby="foodSizeHelp foodSizeError">
+                <small class="field-help field-help--sr-only" id="foodSizeHelp">填写单个正整数，不添加单位；默认 <code data-json-default="food_size">null</code></small>
+                <small class="field-error" id="foodSizeError"></small>
+              </label>
+            </div>
+
+            <div class="field field--choice">
+              <span class="field-label">
+                <span class="field-name"><b>容器类型</b><code>container_type</code></span>
+                <span class="json-type" data-json-type="container_type" title="默认 [&quot;无&quot;]">list[string]</span>
+              </span>
+              <div class="choice-grid" id="containerChoices" role="group" aria-label="容器类型" aria-describedby="containerTypeHelp containerTypeError"></div>
+              <small class="field-help field-help--sr-only" id="containerTypeHelp">多选；默认 <code data-json-default="container_type">["无"]</code></small>
+              <small class="field-error" id="containerTypeError"></small>
+            </div>
+
+            <div class="field field--choice">
+              <span class="field-label">
+                <span class="field-name"><b>附件类型</b><code>accessory_type</code></span>
+                <span class="json-type" data-json-type="accessory_type" title="默认 [&quot;无&quot;]">list[string]</span>
+              </span>
+              <div class="choice-grid" id="accessoryChoices" role="group" aria-label="附件类型" aria-describedby="accessoryTypeHelp accessoryTypeError"></div>
+              <small class="field-help field-help--sr-only" id="accessoryTypeHelp">多选；默认 <code data-json-default="accessory_type">["无"]</code></small>
+              <small class="field-error" id="accessoryTypeError"></small>
+            </div>
+
+            <div class="field field--choice">
+              <span class="field-label">
+                <span class="field-name"><b>附件层位</b><code>rack_level</code></span>
+                <span class="json-type" data-json-type="rack_level" title="默认 [&quot;无&quot;]">list[string]</span>
+              </span>
+              <div class="choice-grid choice-grid--compact" id="rackChoices" role="group" aria-label="附件层位" aria-describedby="rackLevelHelp rackLevelError"></div>
+              <small class="field-help field-help--sr-only" id="rackLevelHelp">多选；默认 <code data-json-default="rack_level">["无"]</code></small>
+              <small class="field-error" id="rackLevelError"></small>
+            </div>
+          </fieldset>
+        </form>
+
+        <div class="annotation-actions">
+          <div class="save-state" id="saveState" aria-live="polite">选择图像后开始标注</div>
+          <div class="save-buttons">
+            <button type="button" class="button button--secondary" id="saveButton" disabled>保存</button>
+            <button type="button" class="button button--primary" id="saveNextButton" disabled>
+              保存并下一张 <span aria-hidden="true">→</span>
+            </button>
+          </div>
+          <div class="save-shortcut">E 保存并下一张 · Ctrl / ⌘ + S 保存</div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <dialog class="statistics-dialog" id="statisticsDialog" aria-labelledby="statisticsDialogTitle" aria-describedby="statisticsDialogDescription">
+    <div class="statistics-modal">
+      <header class="statistics-modal-header">
+        <div class="statistics-modal-heading">
+          <span class="eyebrow">数据均衡性</span>
+          <h2 id="statisticsDialogTitle">属性分布统计</h2>
+          <p id="statisticsDialogDescription">统计当前文件夹中已保存且有效的 JSON；当前未保存的修改不会计入。</p>
+        </div>
+        <div class="statistics-modal-actions">
+          <button type="button" class="button button--subtle button--compact" id="refreshStatisticsButton" aria-busy="false">
+            <span class="refresh-icon" aria-hidden="true">↻</span>
+            <span id="refreshStatisticsButtonText">刷新</span>
+          </button>
+          <button type="button" class="dialog-close-button" id="closeStatisticsButton" aria-label="关闭属性分布统计" title="关闭（Esc）" autofocus>×</button>
+        </div>
+      </header>
+
+      <div class="statistics-modal-body">
+        <section class="statistics-overview" id="statisticsOverview" aria-label="统计概览" hidden>
+          <article class="overview-card overview-card--primary">
+            <span>有效标注</span>
+            <strong id="statisticsValidCount">0</strong>
+            <small id="statisticsLabeledDetail">共 0 份已保存 JSON</small>
+          </article>
+          <article class="overview-card overview-card--success">
+            <span>有效覆盖率</span>
+            <strong id="statisticsCoverage">0%</strong>
+            <small id="statisticsTotalDetail">共 0 张图像</small>
+          </article>
+          <article class="overview-card overview-card--warning">
+            <span>未标注</span>
+            <strong id="statisticsUnlabeledCount">0</strong>
+            <small>尚无对应 JSON</small>
+          </article>
+          <article class="overview-card overview-card--danger">
+            <span>异常 JSON</span>
+            <strong id="statisticsInvalidCount">0</strong>
+            <small>不计入属性分布</small>
+          </article>
+        </section>
+
+        <div class="statistics-context" id="statisticsContext" hidden>
+          <p><span class="context-dot" aria-hidden="true"></span>条形长度表示该值占有效标注图片的比例；多选属性的各项占比之和可能超过 100%。</p>
+          <time id="statisticsUpdatedAt"></time>
+        </div>
+
+        <span class="sr-only" id="statisticsStatus" role="status" aria-live="polite"></span>
+        <section class="statistics-content" id="statisticsContent" aria-busy="false">
+          <div class="statistics-loading">
+            <span class="spinner" aria-hidden="true"></span>
+            <strong>正在汇总属性分布…</strong>
+            <p>数据量较大时可能需要一点时间。</p>
+          </div>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="directory-dialog" id="dataDirectoryDialog" aria-labelledby="dataDirectoryDialogTitle" aria-describedby="dataDirectoryDialogHelp">
+    <form class="directory-dialog-card" id="dataDirectoryForm">
+      <div class="directory-dialog-heading">
+        <div>
+          <span class="eyebrow">Linux 服务器目录</span>
+          <h2 id="dataDirectoryDialogTitle">选择标注文件夹</h2>
+        </div>
+        <button type="button" class="directory-dialog-close" id="cancelDataDirectoryIcon" aria-label="关闭">×</button>
+      </div>
+      <p id="dataDirectoryDialogHelp">这里浏览的是运行标注服务的 Linux 服务器。单击文件夹可选择，双击或按 Enter 可进入。</p>
+
+      <div class="directory-browser-toolbar">
+        <button type="button" class="button button--subtle button--compact directory-browser-tool" id="dataDirectoryUpButton" title="返回上一级目录" aria-label="返回上一级目录">
+          <span aria-hidden="true">↑</span><span>上一级</span>
+        </button>
+        <nav class="directory-breadcrumbs" id="dataDirectoryBreadcrumbs" aria-label="当前目录路径"></nav>
+        <button type="button" class="button button--subtle button--compact directory-browser-tool directory-browser-refresh" id="dataDirectoryRefreshButton" title="刷新当前目录" aria-label="刷新当前目录">
+          <span aria-hidden="true">↻</span><span class="sr-only">刷新</span>
+        </button>
+      </div>
+
+      <div class="directory-address-row">
+        <label for="dataDirectoryPathInput">地址</label>
+        <input id="dataDirectoryPathInput" name="data_directory" type="text" autocomplete="off" spellcheck="false" placeholder="/models/wangzhuo/data/label-task" aria-describedby="dataDirectoryAddressHelp dataDirectoryError">
+        <button type="button" class="button button--secondary button--compact" id="dataDirectoryGoButton">转到</button>
+      </div>
+      <small class="sr-only" id="dataDirectoryAddressHelp">输入 Linux 服务器绝对路径后按 Enter 或点击转到</small>
+
+      <div class="directory-browser" id="dataDirectoryBrowser" aria-busy="false">
+        <div class="directory-browser-state" id="dataDirectoryLoading" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>正在读取服务器文件夹…</span>
+        </div>
+        <div class="directory-browser-state" id="dataDirectoryEmpty" hidden>
+          <span class="directory-empty-icon" aria-hidden="true">□</span>
+          <strong>此文件夹中没有子文件夹</strong>
+          <small>仍可直接选择当前文件夹。</small>
+        </div>
+        <div class="directory-browser-list" id="dataDirectoryList" role="listbox" aria-label="服务器文件夹列表" tabindex="-1" hidden></div>
+      </div>
+
+      <div class="directory-selection-summary">
+        <span>当前浏览：<code id="browseDataDirectoryText">—</code></span>
+        <span>当前选择：<code id="selectedDataDirectoryText">—</code></span>
+      </div>
+      <small class="directory-current-path">服务当前使用：<code id="currentDataDirectoryText"></code></small>
+      <small class="directory-current-path">允许范围：<code id="allowedDataRootsText"></code></small>
+      <p class="directory-dialog-error" id="dataDirectoryError" role="alert" aria-live="polite"></p>
+      <div class="directory-dialog-actions">
+        <button type="button" class="button button--subtle" id="cancelDataDirectoryButton">取消</button>
+        <button type="submit" class="button button--primary" id="confirmDataDirectoryButton"><span id="confirmDataDirectoryButtonText">选择此文件夹</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="/static/app.js?v=linux-realtime-stats-2" defer></script>
+</body>
+</html>
