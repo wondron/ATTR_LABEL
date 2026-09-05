@@ -6,15 +6,18 @@ import asyncio
 import json
 import mimetypes
 import os
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal, NoReturn
+from tempfile import SpooledTemporaryFile
+from typing import Any, AsyncIterator, BinaryIO, Literal, NoReturn
 from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Receive, Scope, Send
 
 from .config import (
     ANNOTATION_VERSION,
@@ -23,8 +26,10 @@ from .config import (
     STATIC_DIR,
 )
 from .models import SaveAnnotationRequest, SelectDataDirectoryRequest
+from .export import ExportArchive, NoAnnotatedDataError, create_export_archive
 from .repository import (
     AnnotationRepository,
+    DeleteImageError,
     ImageNotFoundError,
     InvalidAnnotationFileError,
     InvalidImageIdError,
@@ -32,7 +37,95 @@ from .repository import (
     RevisionConflictError,
 )
 from .statistics import build_attribute_statistics
-from .watcher import DirectoryChange, DirectorySyncService
+from .watcher import DirectoryChange, DirectorySyncService, FileStamp, ImageRecord
+
+
+def _matches_stamp(metadata: os.stat_result, stamp: FileStamp, *, compare_ctime: bool = True) -> bool:
+    return (
+        metadata.st_size == stamp.size
+        and metadata.st_mtime_ns == stamp.mtime_ns
+        and (not compare_ctime or metadata.st_ctime_ns == stamp.ctime_ns)
+        and metadata.st_ino == stamp.inode
+    )
+
+
+def _ready_image_paths(snapshot: dict[str, ImageRecord]) -> list[Path]:
+    """只使用已完成校验且仍匹配磁盘版本的图片，避免重复遍历目录。"""
+    paths = []
+    for record in snapshot.values():
+        try:
+            metadata = record.path.stat()
+        except OSError:
+            continue
+        if _matches_stamp(metadata, record.stamp):
+            paths.append(record.path)
+    return paths
+
+
+def _image_not_ready() -> HTTPException:
+    return HTTPException(
+        status_code=425,
+        detail={"code": "image_not_ready", "message": "照片仍在写入或尚未通过完整性检查，请稍后重试。"},
+        headers={"Retry-After": "1", "Cache-Control": "no-store"},
+    )
+
+
+def _copy_image_snapshot(record: ImageRecord) -> BinaryIO:
+    """固定一次已验证的图片内容，避免响应发送时原文件被覆盖造成破图。"""
+    snapshot = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    try:
+        if not _matches_stamp(record.path.stat(), record.stamp):
+            raise _image_not_ready()
+        with record.path.open("rb") as source:
+            # Windows path.stat/fstat can report different ctime meanings;
+            # retain full path checks and check descriptor identity/size/mtime.
+            if not _matches_stamp(os.fstat(source.fileno()), record.stamp, compare_ctime=os.name != "nt"):
+                raise _image_not_ready()
+            shutil.copyfileobj(source, snapshot, length=256 * 1024)
+            if not _matches_stamp(os.fstat(source.fileno()), record.stamp, compare_ctime=os.name != "nt"):
+                raise _image_not_ready()
+        if not _matches_stamp(record.path.stat(), record.stamp):
+            raise _image_not_ready()
+        snapshot.seek(0)
+        return snapshot
+    except BaseException:
+        snapshot.close()
+        raise
+
+
+class ImageSnapshotResponse(StreamingResponse):
+    def __init__(self, snapshot: BinaryIO, size: int, media_type: str) -> None:
+        self.snapshot = snapshot
+        super().__init__(
+            iter(lambda: snapshot.read(256 * 1024), b""),
+            media_type=media_type,
+            headers={"Cache-Control": "no-cache", "Content-Length": str(size)},
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.snapshot.close()
+
+
+class ExportFileResponse(FileResponse):
+    """包括客户端断开/发送失败在内，都清理 ZIP 和 Excel 临时文件。"""
+
+    def __init__(self, archive: ExportArchive) -> None:
+        self.archive = archive
+        super().__init__(
+            archive.path,
+            media_type="application/zip",
+            filename=archive.filename,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.archive.cleanup()
 
 
 def _resolve_allowed_data_roots(values: list[str | Path]) -> tuple[Path, ...]:
@@ -551,8 +644,15 @@ def create_app(
         current_repository, current_generation = repository_for_generation(
             directory_generation
         )
+        snapshot = directory_sync.ready_snapshot(current_generation)
+
+        def collect_images() -> list[dict[str, Any]]:
+            items = current_repository.list_images(_ready_image_paths(snapshot))
+            # 校验期间发生的新覆写也不能从列表绕过预览就绪检查。
+            return [item for item in items if directory_sync.is_ready(item["image_id"], current_generation)]
+
         try:
-            all_items = await asyncio.to_thread(current_repository.list_images)
+            all_items = await asyncio.to_thread(collect_images)
         except RepositoryError as exc:
             _raise_repository_http(exc)
 
@@ -685,9 +785,10 @@ def create_app(
         current_repository, current_generation = repository_for_generation(
             directory_generation
         )
+        snapshot = directory_sync.ready_snapshot(current_generation)
 
         def collect_statistics() -> dict[str, Any]:
-            summary, documents = current_repository.collect_annotation_documents()
+            summary, documents = current_repository.collect_annotation_documents(_ready_image_paths(snapshot))
             return {
                 "summary": summary,
                 "fields": build_attribute_statistics(
@@ -703,23 +804,92 @@ def create_app(
         payload["directory_generation"] = current_generation
         return payload
 
+    @app.get("/api/v1/export")
+    async def export_annotations(
+        directory_generation: int = Query(ge=0),
+    ) -> FileResponse:
+        current_repository, current_generation = repository_for_generation(directory_generation)
+        try:
+            archive = await asyncio.to_thread(
+                create_export_archive,
+                current_repository,
+                lambda image_id: directory_sync.is_ready(image_id, current_generation),
+            )
+        except NoAnnotatedDataError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "no_annotated_data", "message": str(exc)},
+            ) from exc
+        except RepositoryError as exc:
+            _raise_repository_http(exc)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "export_failed", "message": f"导出失败：{exc}"},
+            ) from exc
+        return ExportFileResponse(archive)
+
+    @app.delete("/api/v1/image")
+    async def delete_image(
+        image_id: str = Query(min_length=1),
+        directory_generation: int = Query(ge=0),
+    ) -> dict[str, Any]:
+        # 在锁内重新校验 generation，等待期间切换目录的请求不能继续删除。
+        async with app.state.directory_switch_lock:
+            current_repository, current_generation = repository_for_generation(directory_generation)
+            try:
+                result = await asyncio.to_thread(current_repository.delete_image, image_id)
+            except DeleteImageError as exc:
+                status_code = {"shared_annotation": 409, "image_not_found": 404}.get(exc.code, 500)
+                raise HTTPException(
+                    status_code=status_code,
+                    detail={
+                        "code": exc.code, "message": str(exc), **exc.state,
+                        "directory_generation": current_generation,
+                    },
+                ) from exc
+            except RepositoryError as exc:
+                _raise_repository_http(exc)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={"code": "delete_failed", "message": f"删除失败：{exc}"},
+                ) from exc
+            return {**result, "directory_generation": current_generation}
+
     @app.get("/api/v1/image")
     async def get_image(
         image_id: str = Query(min_length=1),
         directory_generation: int | None = Query(default=None, ge=0),
-    ) -> FileResponse:
-        current_repository, _ = repository_for_generation(directory_generation)
+    ) -> StreamingResponse:
+        current_repository, current_generation = repository_for_generation(directory_generation)
         try:
             image_path = current_repository.resolve_image(image_id)
+            canonical_id = current_repository.image_id_for_path(image_path)
         except RepositoryError as exc:
             _raise_repository_http(exc)
 
+        record = directory_sync.ready_snapshot(current_generation).get(canonical_id)
+        if record is None or record.path != image_path:
+            raise _image_not_ready()
+        try:
+            snapshot = await asyncio.to_thread(_copy_image_snapshot, record)
+        except FileNotFoundError as exc:
+            raise _image_not_ready() from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "image_unreadable", "message": f"暂时无法读取照片：{exc}"},
+                headers={"Cache-Control": "no-store"},
+            ) from exc
+        try:
+            repository_for_generation(current_generation)
+        except HTTPException:
+            snapshot.close()
+            raise
+
         media_type, _ = mimetypes.guess_type(str(image_path))
-        return FileResponse(
-            path=image_path,
-            media_type=media_type or "application/octet-stream",
-            headers={"Cache-Control": "no-cache"},
-        )
+        return ImageSnapshotResponse(snapshot, record.stamp.size, media_type or "application/octet-stream")
 
     @app.get("/api/v1/annotation")
     async def get_annotation(
@@ -764,25 +934,26 @@ def create_app(
         image_id: str = Query(min_length=1),
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
-        current_repository, current_generation = repository_for_generation(
-            directory_generation
-        )
-        try:
-            image_path = current_repository.resolve_image(image_id)
-            canonical_id = current_repository.image_id_for_path(image_path)
-        except RepositoryError as exc:
-            _raise_repository_http(exc)
-
-        async with image_lock(canonical_id):
+        async with app.state.directory_switch_lock:
+            current_repository, current_generation = repository_for_generation(
+                directory_generation
+            )
             try:
-                document, revision = await asyncio.to_thread(
-                    current_repository.save_annotation,
-                    canonical_id,
-                    request.annotations,
-                    request.revision,
-                )
+                image_path = current_repository.resolve_image(image_id)
+                canonical_id = current_repository.image_id_for_path(image_path)
             except RepositoryError as exc:
                 _raise_repository_http(exc)
+
+            async with image_lock(str(current_repository.sidecar_path(image_path))):
+                try:
+                    document, revision = await asyncio.to_thread(
+                        current_repository.save_annotation,
+                        canonical_id,
+                        request.annotations,
+                        request.revision,
+                    )
+                except RepositoryError as exc:
+                    _raise_repository_http(exc)
 
         return {
             "exists": True,

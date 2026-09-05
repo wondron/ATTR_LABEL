@@ -315,7 +315,7 @@ select:focus-visible {
 
 .image-sidebar {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   border-right: 1px solid var(--line);
   background: var(--surface);
 }
@@ -820,7 +820,7 @@ h2 {
 
 .viewer-footer {
   justify-content: space-between;
-  gap: 14px;
+  gap: 8px;
   padding: 0 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   background: var(--viewer-soft);
@@ -934,6 +934,21 @@ h2 {
 }
 
 .button--secondary:hover:not(:disabled) { background: var(--primary-soft); }
+
+.download-button {
+  margin: 0 14px 12px;
+}
+
+.button--danger {
+  color: #ffc1bf;
+  border-color: rgba(255, 135, 131, 0.35);
+  background: rgba(193, 48, 43, 0.15);
+}
+
+.button--danger:hover:not(:disabled) {
+  color: #fff;
+  background: #a62e2a;
+}
 
 .button--subtle {
   border-color: var(--line);

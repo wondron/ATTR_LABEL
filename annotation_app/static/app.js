@@ -2,11 +2,11 @@
   "use strict";
 
   const API_ROOT = "/api/v1";
-  const IMAGE_SYNC_DEBOUNCE_MS = 280;
+  const IMAGE_SYNC_DEBOUNCE_MS = 80;
   const IMAGE_EVENT_RECONNECT_BASE_MS = 1200;
   const IMAGE_EVENT_RECONNECT_MAX_MS = 15000;
-  const IMAGE_CALIBRATION_CONNECTED_MS = 60000;
-  const IMAGE_CALIBRATION_FALLBACK_MS = 10000;
+  const IMAGE_CALIBRATION_CONNECTED_MS = 15000;
+  const IMAGE_CALIBRATION_FALLBACK_MS = 2000;
 
   const DEFAULT_OPTIONS = Object.freeze({
     container_type: [
@@ -36,6 +36,12 @@
     editRevision: 0,
     loadingAnnotation: false,
     saving: false,
+    deleting: false,
+    downloading: false,
+    imageListRevision: 0,
+    imageStateUncertain: false,
+    previewRetryTimer: null,
+    previewRetries: 0,
     switchingFolder: false,
     browsingFolder: false,
     statisticsLoading: false,
@@ -117,6 +123,8 @@
     fitButton: byId("fitButton"),
     previousButton: byId("previousButton"),
     nextButton: byId("nextButton"),
+    deleteImageButton: byId("deleteImageButton"),
+    downloadAnnotatedButton: byId("downloadAnnotatedButton"),
     statusBanner: byId("statusBanner"),
     statusBannerTitle: byId("statusBannerTitle"),
     statusBannerText: byId("statusBannerText"),
@@ -539,6 +547,8 @@
     if (!imageSyncCanRun()) return;
     state.imageSyncAutoSelect = state.imageSyncAutoSelect || Boolean(settings.autoSelectFirst);
     clearImageSyncTimer("imageCalibrationTimer");
+    // Keep the first deadline so continuous camera events cannot starve syncing.
+    if (state.imageSyncDebounceTimer != null && settings.delay !== 0) return;
     clearImageSyncTimer("imageSyncDebounceTimer");
     const delay = Number.isFinite(Number(settings.delay))
       ? Math.max(0, Number(settings.delay))
@@ -554,7 +564,7 @@
   async function syncImagesSilently(options) {
     const settings = options || {};
     if (!imageSyncCanRun()) return false;
-    if (state.saving) {
+    if (state.saving || state.deleting) {
       scheduleSilentImageSync({
         delay: 500,
         autoSelectFirst: settings.autoSelectFirst
@@ -568,8 +578,7 @@
     }
 
     const requestedGeneration = state.directoryGeneration;
-    const wasEmpty = state.images.length === 0;
-    const hadCurrentImage = Boolean(state.currentImage);
+    const listRevision = state.imageListRevision;
     state.imageSyncInFlight = true;
     try {
       const payload = await apiRequest(withDirectoryGeneration("/images"));
@@ -578,6 +587,9 @@
         || requestedGeneration !== state.directoryGeneration
         || state.switchingFolder
         || state.directoryStale
+        || state.deleting
+        || state.saving
+        || listRevision !== state.imageListRevision
       ) return false;
 
       const payloadGeneration = parseDirectoryGeneration(payload);
@@ -586,16 +598,28 @@
         return false;
       }
 
-      mergeImageItems(normaliseImageItems(payload));
+      const incoming = normaliseImageItems(payload);
+      if (state.imageStateUncertain) {
+        const remaining = incoming.find((item) => imageKey(item.id) === currentImageKey());
+        if (!remaining) clearCurrentImage();
+        else applyDeletedImageState(remaining.id, {
+          image_exists: true, annotation_exists: remaining.annotation_exists
+        });
+        state.imageStateUncertain = false;
+      }
+      const previousImage = state.currentImage;
+      mergeImageItems(incoming);
       applyImageSummary(payload);
       updateStats();
       applyListFilters();
       updateControls();
       setServiceStatus("online", "服务正常");
+      if (previousImage && state.currentImage && (
+        previousImage.modified_at !== state.currentImage.modified_at
+        || previousImage.size !== state.currentImage.size
+      )) loadPreview(state.currentImage);
 
       const canAutoSelect = Boolean(settings.autoSelectFirst)
-        && wasEmpty
-        && !hadCurrentImage
         && !state.currentImage
         && !state.loadingAnnotation
         && !state.saving;
@@ -700,7 +724,8 @@
       state.imageEventConnected = true;
       state.imageEventFailures = 0;
       clearImageSyncTimer("imageEventReconnectTimer");
-      scheduleImageCalibration(IMAGE_CALIBRATION_CONNECTED_MS);
+      // Reconcile the gap between the initial list and subscription/reconnection.
+      scheduleSilentImageSync({ delay: 0, autoSelectFirst: true });
     };
     source.onmessage = receive;
     for (const eventName of [
@@ -760,6 +785,185 @@
       setServiceStatus("offline", "无法连接");
       showToast("图像列表读取失败", error.message, "error", 8000);
       return false;
+    }
+  }
+
+  async function downloadAnnotatedData() {
+    if (state.downloading || state.switchingFolder || state.deleting || state.directoryStale || state.directoryGeneration == null) return;
+    state.downloading = true;
+    const generation = state.directoryGeneration;
+    const folderName = String(state.config && state.config.data_dir || elements.rootPath.textContent)
+      .replace(/\\/g, "/").split("/").filter(Boolean).pop() || "已标注数据";
+    updateControls();
+    try {
+      const response = await fetch(`${API_ROOT}${withDirectoryGeneration("/export")}`, { cache: "no-store" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const error = new Error(extractErrorMessage(payload, `下载失败（HTTP ${response.status}）`));
+        error.payload = payload;
+        error.code = payload && payload.detail && payload.detail.code;
+        throw error;
+      }
+      const blob = await response.blob();
+      if (generation !== state.directoryGeneration || state.directoryStale) return;
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      let filename = `${folderName}.zip`;
+      if (match) {
+        try { filename = decodeURIComponent(match[1]); } catch (_error) { /* Keep the folder name. */ }
+      }
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      showToast("下载已准备好", filename, "success");
+    } catch (error) {
+      if (generation !== state.directoryGeneration) return;
+      if (isDirectoryChangedError(error)) markDirectoryStale(error.payload && error.payload.detail);
+      showToast("下载未完成", error.message, error.code === "no_annotated_data" ? "info" : "error", 8000);
+    } finally {
+      state.downloading = false;
+      updateControls();
+    }
+  }
+
+  function clearCurrentImage() {
+    state.loadSequence += 1;
+    clearImageSyncTimer("previewRetryTimer");
+    if (state.currentImage) state.draftImageIds.delete(currentImageKey());
+    state.currentImage = null;
+    state.annotationExists = false;
+    state.annotationInvalid = false;
+    state.revision = null;
+    state.loadingAnnotation = false;
+    state.imageStateUncertain = false;
+    elements.currentFileName.textContent = "尚未选择图像";
+    elements.currentFileName.title = "";
+    elements.previewImage.hidden = true;
+    elements.previewImage.dataset.imageId = "";
+    elements.previewImage.removeAttribute("src");
+    elements.viewerLoading.classList.add("hidden");
+    elements.imageError.classList.add("hidden");
+    elements.zoomToolbar.hidden = true;
+    elements.emptyView.classList.remove("hidden");
+    clearValidationErrors();
+    setDraft(createEmptyAnnotations(state.config), false);
+    showBanner("info", "等待选择", "选择图像后开始标注；新照片写入完成后会自动出现。");
+    setAnnotationState("idle", "等待选择");
+    setSaveState("", "选择图像后开始标注");
+  }
+
+  function applyDeletedImageState(imageId, outcome) {
+    if (!outcome || typeof outcome.image_exists !== "boolean") return;
+    state.imageStateUncertain = false;
+    if (!outcome.image_exists) {
+      if (currentImageKey() === imageKey(imageId)) clearCurrentImage();
+      state.images = state.images.filter((item) => imageKey(item.id) !== imageKey(imageId));
+      state.draftImageIds.delete(imageKey(imageId));
+    } else if (typeof outcome.annotation_exists === "boolean") {
+      const item = state.images.find((image) => imageKey(image.id) === imageKey(imageId));
+      if (item) {
+        item.annotated = outcome.annotation_exists;
+        item.annotation_exists = outcome.annotation_exists;
+        if (!outcome.annotation_exists) {
+          item.annotation_valid = null;
+          item.revision = "__missing__";
+        }
+      }
+      if (currentImageKey() === imageKey(imageId)) {
+        const hadAnnotation = state.annotationExists;
+        state.annotationExists = outcome.annotation_exists;
+        if (!outcome.annotation_exists) {
+          state.annotationInvalid = false;
+          state.revision = "__missing__";
+          if (hadAnnotation || state.dirty) {
+            // The retained form is now the only copy; protect it on navigation.
+            markDirty();
+          } else {
+            setAnnotationState("unlabeled", "未标注");
+            setSaveState("", "尚未保存标注");
+          }
+        }
+      }
+    }
+    updateStats(true);
+    applyListFilters();
+  }
+
+  async function deleteCurrentImage() {
+    if (!state.currentImage || state.deleting || state.downloading || state.saving || state.loadingAnnotation || state.switchingFolder || state.directoryStale || state.imageStateUncertain) return;
+    const imageId = currentImageKey();
+    const imageName = String(state.currentImage.name || imageId);
+    if (!window.confirm(`删除照片：${imageName}\n\n将从磁盘永久删除原图及对应标注文件，无法恢复${state.dirty ? "\n当前未保存的标注也会丢失。" : ""}\n\n确认删除吗？`)) return;
+
+    const generation = state.directoryGeneration;
+    const index = currentFilteredIndex();
+    const nextIds = state.filteredImages.slice(index + 1).map((item) => imageKey(item.id));
+    state.deleting = true;
+    state.imageListRevision += 1;
+    updateControls();
+    let deletionError = null;
+    let outcome = null;
+    try {
+      try {
+        outcome = await apiRequest(withDirectoryGeneration(`/image?image_id=${encodeURIComponent(imageId)}`), {
+          method: "DELETE", headers: { "X-Requested-With": "annotation-ui" }
+        });
+      } catch (error) {
+        deletionError = error;
+        outcome = error.payload && error.payload.detail;
+        if (isDirectoryChangedError(error)) {
+          markDirectoryStale(outcome);
+          return;
+        }
+      }
+      if (generation !== state.directoryGeneration || state.directoryStale) return;
+      applyDeletedImageState(imageId, outcome);
+      try {
+        const payload = await apiRequest(withDirectoryGeneration("/images"));
+        if (generation !== state.directoryGeneration || state.directoryStale) return;
+        const incoming = normaliseImageItems(payload);
+        const remaining = incoming.find((item) => imageKey(item.id) === imageId);
+        if (!remaining && outcome?.image_exists !== true && currentImageKey() === imageId) clearCurrentImage();
+        mergeImageItems(incoming);
+        if (remaining) applyDeletedImageState(imageId, {
+          image_exists: true, annotation_exists: remaining.annotation_exists
+        });
+        state.imageStateUncertain = false;
+        applyImageSummary(payload);
+      } catch (error) {
+        if (isDirectoryChangedError(error)) {
+          markDirectoryStale(error.payload && error.payload.detail);
+          return;
+        }
+        if (typeof outcome?.image_exists !== "boolean") state.imageStateUncertain = true;
+        showToast("列表同步失败", `${error.message}；恢复连接后将自动核对磁盘状态。`, "warning", 8500);
+      }
+      if (deletionError) {
+        showToast("删除失败", deletionError.message, "error", 10000);
+        if (state.currentImage) showBanner("error", "删除失败", deletionError.message);
+      } else {
+        showToast("已永久删除", imageName, "success");
+      }
+    } finally {
+      state.deleting = false;
+      state.imageListRevision += 1;
+      updateStats();
+      applyListFilters();
+      updateControls();
+      if (generation === state.directoryGeneration && !state.directoryStale) {
+        if (!state.currentImage && state.filteredImages.length) {
+          const nextId = nextIds.find((id) => state.filteredImages.some((item) => imageKey(item.id) === id));
+          const fallback = state.filteredImages[Math.max(0, Math.min(index, state.filteredImages.length - 1))];
+          await selectImage(nextId || fallback.id, { skipPrompt: true });
+        }
+        if (elements.statisticsDialog.open) loadStatistics();
+        scheduleSilentImageSync({ delay: 0, autoSelectFirst: true });
+      }
     }
   }
 
@@ -986,6 +1190,9 @@
     stopImageRealtimeSync();
     state.imageEventFailures = 0;
     state.loadSequence += 1;
+    state.imageListRevision += 1;
+    state.imageStateUncertain = false;
+    clearImageSyncTimer("previewRetryTimer");
     state.images = [];
     state.filteredImages = [];
     state.counts = { total: 0, labeled: 0, unlabeled: 0, invalid: 0 };
@@ -1035,7 +1242,7 @@
   }
 
   async function openDataDirectoryDialog() {
-    if (state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving) return;
+    if (state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving || state.deleting || state.downloading) return;
 
     let dialogConfig = state.config || {};
     if (state.directoryStale || state.directoryGeneration == null || !state.config) {
@@ -1092,7 +1299,7 @@
 
   async function chooseDataDirectory(event) {
     event.preventDefault();
-    if (state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving) return;
+    if (state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving || state.deleting || state.downloading) return;
     if (state.directorySwitchGeneration == null) {
       elements.dataDirectoryError.textContent = "服务目录状态尚未就绪，请刷新页面后重试。";
       return;
@@ -1204,7 +1411,8 @@
     return state.images.filter((item) => {
       const itemStatus = imageStatus(item);
       if (status === "labeled") return Boolean(item.annotated);
-      if (status === "unlabeled") return itemStatus === "unlabeled" || itemStatus === "draft";
+      if (status === "unlabeled") return !item.annotated;
+      if (status === "invalid") return Boolean(item.annotated && item.annotation_valid === false);
       return itemStatus === status;
     }).length;
   }
@@ -1531,6 +1739,10 @@
   }
 
   function renderImageList() {
+    const scrollTop = elements.imageList.scrollTop;
+    const focusedId = document.activeElement && document.activeElement.dataset.imageId;
+    const existing = new Map(Array.from(elements.imageList.querySelectorAll(".image-item"))
+      .map((item) => [item.dataset.imageId, item]));
     const fragment = document.createDocumentFragment();
     if (!state.filteredImages.length) {
       const empty = document.createElement("div");
@@ -1543,10 +1755,22 @@
       fragment.append(empty);
     } else {
       for (const item of state.filteredImages) {
-        fragment.append(createImageListItem(item));
+        const previous = existing.get(imageKey(item.id));
+        if (previous && previous.dataset.status === imageStatus(item) && previous.title === String(item.name || item.id)) {
+          previous.setAttribute("aria-selected", imageKey(item.id) === currentImageKey() ? "true" : "false");
+          fragment.append(previous);
+        } else {
+          fragment.append(createImageListItem(item));
+        }
       }
     }
     elements.imageList.replaceChildren(fragment);
+    if (focusedId) {
+      const focused = Array.from(elements.imageList.querySelectorAll(".image-item"))
+        .find((item) => item.dataset.imageId === focusedId);
+      if (focused) focused.focus({ preventScroll: true });
+    }
+    elements.imageList.scrollTop = scrollTop;
   }
 
   function createImageListItem(item) {
@@ -1565,7 +1789,7 @@
     button.setAttribute("role", "option");
     button.setAttribute("aria-selected", imageKey(item.id) === currentImageKey() ? "true" : "false");
     button.title = String(item.name || item.id);
-    button.disabled = state.saving || state.switchingFolder || state.directoryStale;
+    button.disabled = state.saving || state.deleting || state.switchingFolder || state.directoryStale;
 
     const thumb = document.createElement("span");
     thumb.className = "image-thumb";
@@ -1607,7 +1831,7 @@
   }
 
   async function selectImage(id, options) {
-    if (state.saving || state.switchingFolder || state.directoryStale) return;
+    if (state.saving || state.deleting || state.switchingFolder || state.directoryStale) return;
     const settings = options || {};
     const nextImage = state.images.find((item) => imageKey(item.id) === imageKey(id));
     if (!nextImage) return;
@@ -1621,6 +1845,7 @@
     state.revision = null;
     state.dirty = false;
     state.editRevision = 0;
+    state.imageStateUncertain = false;
     state.loadingAnnotation = true;
     state.draft = createEmptyAnnotations(state.config);
 
@@ -1686,7 +1911,9 @@
 
   }
 
-  function loadPreview(image) {
+  function loadPreview(image, retry) {
+    clearImageSyncTimer("previewRetryTimer");
+    if (!retry) state.previewRetries = 0;
     elements.emptyView.classList.add("hidden");
     elements.imageError.classList.add("hidden");
     elements.viewerLoading.classList.remove("hidden");
@@ -1695,8 +1922,10 @@
     elements.zoomToolbar.hidden = true;
     const expectedId = imageKey(image.id);
     elements.previewImage.dataset.imageId = expectedId;
+    elements.previewImage.decoding = "async";
+    elements.previewImage.fetchPriority = "high";
     elements.previewImage.src = `${API_ROOT}${withDirectoryGeneration(
-      `/image?image_id=${encodeURIComponent(image.id)}`
+      `/image?image_id=${encodeURIComponent(image.id)}&v=${encodeURIComponent(`${image.modified_at || ""}:${image.size || ""}`)}${retry ? `&retry=${state.previewRetries}` : ""}`
     )}`;
   }
 
@@ -2003,7 +2232,7 @@
   }
 
   async function saveAnnotation(moveNext) {
-    if (!state.currentImage || state.saving || state.loadingAnnotation || state.switchingFolder || state.directoryStale) return false;
+    if (!state.currentImage || state.saving || state.deleting || state.imageStateUncertain || state.loadingAnnotation || state.switchingFolder || state.directoryStale) return false;
     if (!state.dirty && state.annotationExists && !state.annotationInvalid) {
       if (moveNext) await moveRelative(1);
       return true;
@@ -2022,6 +2251,7 @@
       : null;
     const annotations = serialiseAnnotations();
     state.saving = true;
+    state.imageListRevision += 1;
     updateControls();
     setSaveState("saving", "正在保存 JSON…");
     showBanner("info", "保存中", "正在写入 JSON，请稍候。");
@@ -2091,6 +2321,7 @@
       return false;
     } finally {
       state.saving = false;
+      state.imageListRevision += 1;
       updateControls();
     }
   }
@@ -2103,6 +2334,7 @@
     if (
       state.loadingAnnotation
       || state.saving
+      || state.deleting
       || state.switchingFolder
       || state.directoryStale
       || !state.currentImage
@@ -2119,19 +2351,25 @@
     const index = currentFilteredIndex();
     const total = state.filteredImages.length;
     elements.positionText.textContent = index >= 0 ? `${index + 1} / ${total}` : `0 / ${total}`;
-    const busy = state.loadingAnnotation || state.saving || state.switchingFolder || state.directoryStale;
+    const busy = state.loadingAnnotation || state.saving || state.deleting || state.switchingFolder || state.directoryStale;
     elements.previousButton.disabled = busy || index <= 0;
     elements.nextButton.disabled = busy || index < 0 || index >= total - 1;
   }
 
   function updateControls() {
     const hasImage = Boolean(state.currentImage);
-    const fieldBusy = !hasImage || state.loadingAnnotation || state.switchingFolder;
-    const actionBusy = fieldBusy || state.saving || state.directoryStale;
+    const fieldBusy = !hasImage || state.loadingAnnotation || state.deleting || state.switchingFolder;
+    const actionBusy = fieldBusy || state.saving || state.directoryStale || state.imageStateUncertain;
     const canSave = state.dirty || (hasImage && !state.annotationExists);
     elements.fieldset.disabled = fieldBusy;
     elements.saveButton.disabled = actionBusy || !canSave;
     elements.saveNextButton.disabled = actionBusy || !canSave;
+    elements.deleteImageButton.disabled = actionBusy || state.downloading;
+    elements.deleteImageButton.textContent = state.deleting ? "正在删除…" : "删除当前图像";
+    elements.deleteImageButton.setAttribute("aria-busy", String(state.deleting));
+    elements.downloadAnnotatedButton.disabled = state.downloading || state.deleting || state.saving || state.switchingFolder || state.directoryStale || state.directoryGeneration == null;
+    elements.downloadAnnotatedButton.textContent = state.downloading ? "正在打包…" : "下载已标注数据";
+    elements.downloadAnnotatedButton.setAttribute("aria-busy", String(state.downloading));
     const statisticsDirectoryPending = state.directoryGeneration == null;
     elements.openStatisticsButton.disabled = state.switchingFolder
       || state.browsingFolder
@@ -2149,11 +2387,11 @@
           ? "数据目录已切换，请重新选择文件夹或刷新页面"
           : "查看当前文件夹的属性值分布";
     elements.refreshStatisticsButton.disabled = state.statisticsLoading || state.switchingFolder || state.directoryStale;
-    elements.chooseDataDirButton.disabled = state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving;
-    elements.search.disabled = state.switchingFolder || state.directoryStale;
-    elements.filter.disabled = state.switchingFolder || state.directoryStale;
+    elements.chooseDataDirButton.disabled = state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving || state.deleting || state.downloading;
+    elements.search.disabled = state.deleting || state.switchingFolder || state.directoryStale;
+    elements.filter.disabled = state.deleting || state.switchingFolder || state.directoryStale;
     for (const item of elements.imageList.querySelectorAll(".image-item")) {
-      item.disabled = state.saving || state.switchingFolder || state.directoryStale;
+      item.disabled = state.saving || state.deleting || state.switchingFolder || state.directoryStale;
     }
     updateNavigation();
   }
@@ -2184,10 +2422,12 @@
   }
 
   function isTextEntryControl(target) {
-    return target instanceof Element && Boolean(target.closest("input, select, textarea, [contenteditable='true']"));
+    return target instanceof Element && (target.isContentEditable || Boolean(target.closest("input, select, textarea, [contenteditable]:not([contenteditable='false']), [role='textbox']")));
   }
 
   function bindEvents() {
+    elements.deleteImageButton.addEventListener("click", deleteCurrentImage);
+    elements.downloadAnnotatedButton.addEventListener("click", downloadAnnotatedData);
     elements.openStatisticsButton.addEventListener("click", openStatistics);
     elements.closeStatisticsButton.addEventListener("click", closeStatistics);
     elements.refreshStatisticsButton.addEventListener("click", loadStatistics);
@@ -2265,7 +2505,8 @@
     });
 
     elements.previewImage.addEventListener("load", () => {
-      if (elements.previewImage.dataset.imageId !== currentImageKey()) return;
+      if (!state.currentImage || elements.previewImage.dataset.imageId !== currentImageKey()) return;
+      clearImageSyncTimer("previewRetryTimer");
       elements.viewerLoading.classList.add("hidden");
       elements.imageError.classList.add("hidden");
       elements.previewImage.hidden = false;
@@ -2274,7 +2515,17 @@
     });
 
     elements.previewImage.addEventListener("error", () => {
-      if (elements.previewImage.dataset.imageId !== currentImageKey()) return;
+      if (!state.currentImage || elements.previewImage.dataset.imageId !== currentImageKey() || state.deleting) return;
+      if (!state.directoryStale && state.previewRetries < 3) {
+        state.previewRetries += 1;
+        const imageId = currentImageKey();
+        state.previewRetryTimer = window.setTimeout(() => {
+          state.previewRetryTimer = null;
+          if (currentImageKey() === imageId && !state.directoryStale) loadPreview(state.currentImage, true);
+        }, 300 * state.previewRetries);
+        scheduleSilentImageSync({ delay: 0 });
+        return;
+      }
       elements.viewerLoading.classList.add("hidden");
       elements.previewImage.hidden = true;
       elements.zoomToolbar.hidden = true;
@@ -2336,6 +2587,11 @@
         return;
       }
       if (!modifier && !event.altKey && !event.repeat && !isTextEntryControl(event.target)) {
+        if (key === "d") {
+          event.preventDefault();
+          deleteCurrentImage();
+          return;
+        }
         if (key === "q") {
           event.preventDefault();
           moveRelative(-1);

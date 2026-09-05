@@ -10,6 +10,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from annotation_app.config import MISSING_REVISION
 from annotation_app.main import create_app
@@ -57,8 +58,8 @@ class LinuxDirectorySwitchTests(unittest.TestCase):
             new_dir = root / "新 目录"
             old_dir.mkdir()
             new_dir.mkdir()
-            (old_dir / "old.jpg").write_bytes(b"\xff\xd8\xff\xd9")
-            (new_dir / "new.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+            Image.new("RGB", (8, 8), "red").save(old_dir / "old.jpg")
+            Image.new("RGB", (8, 8), "blue").save(new_dir / "new.jpg")
 
             with TestClient(
                 create_app(old_dir, allowed_data_roots=(root,))
@@ -116,7 +117,7 @@ class LinuxDirectorySwitchTests(unittest.TestCase):
             allowed_root = Path(allowed_temporary).resolve()
             current = allowed_root / "current"
             current.mkdir()
-            (current / "keep.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+            Image.new("RGB", (8, 8), "red").save(current / "keep.jpg")
             outside = Path(outside_temporary).resolve()
 
             with TestClient(

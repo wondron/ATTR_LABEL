@@ -7,9 +7,11 @@ import json
 import os
 import secrets
 import stat
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from threading import RLock
 from typing import Any
 
 from pydantic import ValidationError
@@ -32,6 +34,15 @@ class ImageNotFoundError(RepositoryError):
 
 class InvalidAnnotationFileError(RepositoryError):
     """已有 sidecar 文件无法解析。"""
+
+
+class DeleteImageError(RepositoryError):
+    """删除失败，携带已经核实的磁盘状态。"""
+
+    def __init__(self, message: str, state: dict[str, Any], *, code: str = "delete_failed") -> None:
+        super().__init__(message)
+        self.state = state
+        self.code = code
 
 
 class RevisionConflictError(RepositoryError):
@@ -93,6 +104,12 @@ def _create_atomic_temporary_file(
 class AnnotationRepository:
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = self._prepare_data_dir(data_dir, create=True)
+        self._initialize_state()
+
+    def _initialize_state(self) -> None:
+        # 所有写入和删除共用锁；同 stem 不同扩展也可能共享一个 JSON。
+        self.mutation_lock = RLock()
+        self._document_cache: OrderedDict[Path, tuple[tuple[int, ...], Any]] = OrderedDict()
 
     @staticmethod
     def _prepare_data_dir(data_dir: str | Path, *, create: bool) -> Path:
@@ -121,6 +138,7 @@ class AnnotationRepository:
         resolved = cls._prepare_data_dir(data_dir, create=False)
         cls._ensure_data_dir_access(resolved)
         repository.data_dir = resolved
+        repository._initialize_state()
         return repository
 
     def set_data_dir(self, data_dir: str | Path) -> Path:
@@ -128,30 +146,41 @@ class AnnotationRepository:
         resolved = self._prepare_data_dir(data_dir, create=False)
         self._ensure_data_dir_access(resolved)
         self.data_dir = resolved
+        self._initialize_state()
         return resolved
 
     def _normalize_id(self, image_id: str) -> PurePosixPath:
         if not isinstance(image_id, str):
             raise InvalidImageIdError("image_id 必须是字符串。")
         image_id = image_id.strip().replace("\\", "/")
-        if not image_id or "\x00" in image_id:
+        if not image_id or any(ord(character) < 32 for character in image_id):
             raise InvalidImageIdError("image_id 不能为空。")
 
         relative = PurePosixPath(image_id)
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} or ":" in part for part in relative.parts
+        ):
             raise InvalidImageIdError("image_id 必须是数据目录内的安全相对路径。")
         return relative
 
-    def resolve_image(self, image_id: str) -> Path:
+    def _safe_image_path(self, image_id: str) -> Path:
         relative = self._normalize_id(image_id)
-        candidate = (self.data_dir / Path(*relative.parts)).resolve(strict=False)
-        try:
-            candidate.relative_to(self.data_dir)
-        except ValueError as exc:
-            raise InvalidImageIdError("image_id 指向了数据目录之外。") from exc
+        candidate = self.data_dir
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink() or (
+                hasattr(candidate, "is_junction") and candidate.is_junction()
+            ):
+                raise InvalidImageIdError("不支持通过符号链接访问或删除图像。")
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_relative_to(self.data_dir):
+            raise InvalidImageIdError("image_id 指向了数据目录之外。")
+        if resolved.suffix.lower() not in IMAGE_SUFFIXES:
+            raise InvalidImageIdError(f"不支持的图像类型：{resolved.suffix or '(无后缀)'}")
+        return resolved
 
-        if candidate.suffix.lower() not in IMAGE_SUFFIXES:
-            raise InvalidImageIdError(f"不支持的图像类型：{candidate.suffix or '(无后缀)'}")
+    def resolve_image(self, image_id: str) -> Path:
+        candidate = self._safe_image_path(image_id)
         if not candidate.is_file():
             raise ImageNotFoundError(f"图像不存在：{image_id}")
         return candidate
@@ -168,20 +197,27 @@ class AnnotationRepository:
     def sidecar_path(image_path: Path) -> Path:
         return image_path.with_suffix(".json")
 
+    def checked_sidecar_path(self, image_path: Path) -> Path:
+        sidecar = self.sidecar_path(image_path)
+        if sidecar.is_symlink() or not sidecar.resolve(strict=False).is_relative_to(self.data_dir):
+            raise InvalidAnnotationFileError(f"标注文件不能是符号链接或指向目录之外：{sidecar.name}")
+        if sidecar.exists() and not sidecar.is_file():
+            raise InvalidAnnotationFileError(f"标注路径不是普通文件：{sidecar.name}")
+        return sidecar
+
     def _iter_image_paths(self) -> Iterator[Path]:
         for path in self.data_dir.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
                 continue
             try:
-                resolved = path.resolve()
-                resolved.relative_to(self.data_dir)
-            except (OSError, ValueError):
+                resolved = self._safe_image_path(path.relative_to(self.data_dir).as_posix())
+            except (OSError, ValueError, RepositoryError):
                 continue
             yield resolved
 
-    def list_images(self) -> list[dict[str, Any]]:
+    def list_images(self, image_paths: Iterable[Path] | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        for resolved in self._iter_image_paths():
+        for resolved in self._iter_image_paths() if image_paths is None else image_paths:
             image_id = self.image_id_for_path(resolved)
             sidecar = self.sidecar_path(resolved)
             annotation_exists = sidecar.is_file()
@@ -200,7 +236,11 @@ class AnnotationRepository:
                     except OSError:
                         revision = None
 
-            stat = resolved.stat()
+            try:
+                stat = resolved.stat()
+            except FileNotFoundError:
+                # 扫描过程中允许外部相机/文件管理器移走文件。
+                continue
             items.append(
                 {
                     "image_id": image_id,
@@ -223,6 +263,7 @@ class AnnotationRepository:
 
     def collect_annotation_documents(
         self,
+        image_paths: Iterable[Path] | None = None,
     ) -> tuple[dict[str, int], list[AnnotationDocument]]:
         """单次扫描目录并返回统计基数与所有有效标注文档。"""
         total = 0
@@ -230,7 +271,7 @@ class AnnotationRepository:
         invalid = 0
         documents: list[AnnotationDocument] = []
 
-        for image_path in self._iter_image_paths():
+        for image_path in self._iter_image_paths() if image_paths is None else image_paths:
             total += 1
             sidecar = self.sidecar_path(image_path)
             if not sidecar.is_file():
@@ -277,7 +318,33 @@ class AnnotationRepository:
             raise RepositoryError(f"无法读取已有标注：{sidecar.name}") from exc
 
     def _read_document(self, image_path: Path) -> tuple[AnnotationDocument, str]:
-        sidecar = self.sidecar_path(image_path)
+        with self.mutation_lock:
+            sidecar = self.checked_sidecar_path(image_path)
+            try:
+                metadata = sidecar.stat()
+            except OSError as exc:
+                raise InvalidAnnotationFileError(f"无法读取标注文件：{sidecar.name}：{exc}") from exc
+            signature = (metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_size, metadata.st_ino)
+            cached = self._document_cache.get(image_path)
+            if cached is not None and cached[0] == signature:
+                self._document_cache.move_to_end(image_path)
+                if isinstance(cached[1], str):
+                    raise InvalidAnnotationFileError(cached[1])
+                return cached[1]
+            try:
+                result = self._read_uncached_document(image_path)
+            except InvalidAnnotationFileError as exc:
+                self._document_cache[image_path] = (signature, str(exc))
+                raise
+            else:
+                self._document_cache[image_path] = (signature, result)
+                return result
+            finally:
+                while len(self._document_cache) > 32768:
+                    self._document_cache.popitem(last=False)
+
+    def _read_uncached_document(self, image_path: Path) -> tuple[AnnotationDocument, str]:
+        sidecar = self.checked_sidecar_path(image_path)
         try:
             raw_bytes = sidecar.read_bytes()
             raw = json.loads(raw_bytes.decode("utf-8-sig"))
@@ -324,8 +391,17 @@ class AnnotationRepository:
         annotations: AnnotationValues,
         expected_revision: str = MISSING_REVISION,
     ) -> tuple[AnnotationDocument, str]:
+        with self.mutation_lock:
+            return self._save_annotation(image_id, annotations, expected_revision)
+
+    def _save_annotation(
+        self,
+        image_id: str,
+        annotations: AnnotationValues,
+        expected_revision: str,
+    ) -> tuple[AnnotationDocument, str]:
         image_path = self.resolve_image(image_id)
-        sidecar = self.sidecar_path(image_path)
+        sidecar = self.checked_sidecar_path(image_path)
 
         current_revision: str | None = None
         preserved_mode: int | None = None
@@ -381,3 +457,49 @@ class AnnotationRepository:
                     pass
 
         return document, hashlib.sha256(encoded).hexdigest()
+
+    def delete_image(self, image_id: str) -> dict[str, Any]:
+        """先删除原图再删除 JSON；失败时保留其余文件并报告实际状态。"""
+        with self.mutation_lock:
+            image_path = self._safe_image_path(image_id)
+            sidecar = self.sidecar_path(image_path)
+
+            def state() -> dict[str, Any]:
+                def exists(path: Path) -> bool | None:
+                    try:
+                        path.lstat()
+                        return True
+                    except FileNotFoundError:
+                        return False
+                    except OSError:
+                        return None
+                return {
+                    "image_id": image_id,
+                    "image_exists": exists(image_path),
+                    "annotation_exists": exists(sidecar),
+                }
+
+            try:
+                if not image_path.is_file():
+                    raise DeleteImageError(f"图像不存在：{image_id}", state(), code="image_not_found")
+                self.checked_sidecar_path(image_path)
+                if sidecar.exists():
+                    siblings = [
+                        path.name for path in image_path.parent.iterdir()
+                        if path != image_path and path.suffix.lower() in IMAGE_SUFFIXES
+                        and path.with_suffix(".json") == sidecar and path.is_file()
+                    ]
+                    if siblings:
+                        raise DeleteImageError(
+                            "标注文件与其他图像共用，无法安全删除：" + "、".join(siblings),
+                            state(), code="shared_annotation",
+                        )
+                image_path.unlink()
+                sidecar.unlink(missing_ok=True)
+            except DeleteImageError:
+                raise
+            except (OSError, RepositoryError) as exc:
+                raise DeleteImageError(f"删除失败：{exc}", state()) from exc
+            finally:
+                self._document_cache.pop(image_path, None)
+            return {"status": "deleted", **state()}

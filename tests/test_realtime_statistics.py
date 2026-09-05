@@ -14,6 +14,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from annotation_app.config import MISSING_REVISION
 from annotation_app.main import create_app
@@ -40,7 +41,7 @@ class LinuxStatisticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary).resolve()
             for name in ("a.jpg", "b.jpg", "c.jpg"):
-                (data_dir / name).write_bytes(b"image")
+                Image.new("RGB", (8, 8), "red").save(data_dir / name)
             (data_dir / "b.json").write_text("{invalid", encoding="utf-8")
 
             with TestClient(
@@ -152,7 +153,7 @@ class DirectorySyncServiceTests(unittest.TestCase):
                 new_token, new_queue = service.subscribe(5)
                 try:
                     image_path = new_dir / "新增 图片.jpg"
-                    image_path.write_bytes(b"stable-image-content")
+                    Image.new("RGB", (8, 8), "red").save(image_path)
                     deadline = asyncio.get_running_loop().time() + 6
                     announced = None
                     while announced is None:
@@ -190,7 +191,7 @@ class LinuxSidecarPermissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary).resolve()
             image = data_dir / "permission.jpg"
-            image.write_bytes(b"image")
+            Image.new("RGB", (8, 8), "red").save(image)
             repository = AnnotationRepository.open_existing(data_dir)
             values = AnnotationValues.model_validate(sample_annotations())
 

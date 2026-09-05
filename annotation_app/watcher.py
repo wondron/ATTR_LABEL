@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from PIL import Image
+
 from .config import IMAGE_SUFFIXES
 
 try:  # The polling fallback deliberately keeps the application usable.
@@ -123,20 +125,20 @@ class _WatchdogEventHandler(FileSystemEventHandler):  # type: ignore[misc]
 class DirectorySyncService:
     """Watch one recursive image tree and fan changes out to SSE clients.
 
-    Files are not announced until their size and timestamps have remained
-    stable across multiple probes.  This prevents the browser from attempting
-    to load an image while camera software is still writing it.
+    Files are not announced until their metadata has settled and their full
+    image contents decode successfully. A paused, truncated camera write must
+    not become visible merely because its size briefly stopped changing.
     """
 
     def __init__(
         self,
         *,
-        debounce_seconds: float = 0.35,
-        stability_interval: float = 0.25,
+        debounce_seconds: float = 0.06,
+        stability_interval: float = 0.12,
         stable_samples: int = 2,
         stability_timeout: float = 10.0,
-        observer_reconcile_interval: float = 5.0,
-        fallback_poll_interval: float = 1.0,
+        observer_reconcile_interval: float = 1.0,
+        fallback_poll_interval: float = 0.5,
         raw_queue_size: int = 4096,
         subscriber_queue_size: int = 256,
     ) -> None:
@@ -163,6 +165,8 @@ class DirectorySyncService:
         self._pending_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_events: dict[str, RawWatchEvent] = {}
         self._known: dict[str, ImageRecord] = {}
+        self._validation_cache: dict[str, tuple[FileStamp, bool, float]] = {}
+        self._validation_slots = asyncio.Semaphore(4)
         self._subscribers: dict[
             int, tuple[int, asyncio.Queue[DirectoryChange]]
         ] = {}
@@ -177,6 +181,36 @@ class DirectorySyncService:
     @property
     def generation(self) -> int:
         return self._generation
+
+    def ready_snapshot(
+        self, generation: int | None = None,
+    ) -> dict[str, ImageRecord]:
+        """Return validated signatures, keyed by the original image IDs.
+
+        Listing code must compare these stamps with its current disk scan;
+        an already published image may since have been replaced or deleted.
+        Use ``is_ready`` to guard an individual image response.
+        """
+        if generation is not None and generation != self._generation:
+            return {}
+        return {record.image_id: record for record in self._known.values()}
+
+    def is_ready(self, image_id: str, generation: int | None = None) -> bool:
+        """Check that a file still matches its validated contents on disk."""
+        if generation is not None and generation != self._generation:
+            return False
+        root = self._root
+        previous = self._known.get(self._id_key(image_id))
+        if root is None or previous is None:
+            return False
+        current = self._read_record(previous.path, root)
+        return (
+            root == self._root
+            and (generation is None or generation == self._generation)
+            and self._known.get(self._id_key(image_id)) == previous
+            and current is not None
+            and current.stamp == previous.stamp
+        )
 
     @property
     def observer_active(self) -> bool:
@@ -197,8 +231,8 @@ class DirectorySyncService:
             self._raw_queue = asyncio.Queue(maxsize=self._raw_queue_size)
             self._root = Path(data_dir).resolve()
             self._generation = generation
-            initial = await asyncio.to_thread(self._scan_directory, self._root)
-            self._known = initial or {}
+            self._known = {}
+            self._validation_cache.clear()
             self._consumer_task = asyncio.create_task(
                 self._consume_events(), name="annotation-directory-events"
             )
@@ -206,6 +240,7 @@ class DirectorySyncService:
                 self._reconcile_loop(), name="annotation-directory-reconcile"
             )
             await self._start_observer()
+            await self._prime_directory()
 
     async def stop(self) -> None:
         async with self._control_lock:
@@ -233,6 +268,8 @@ class DirectorySyncService:
             self._reconcile_task = None
             self._raw_queue = None
             self._loop = None
+            self._known.clear()
+            self._validation_cache.clear()
 
     async def switch_directory(
         self,
@@ -252,6 +289,11 @@ class DirectorySyncService:
 
             # Change this before stopping Observer so late callbacks are stale.
             self._generation = generation
+            # Requests using the new generation must never see the old tree
+            # while stopping its observer yields control to the event loop.
+            self._root = None
+            self._known.clear()
+            self._validation_cache.clear()
             await self._stop_observer()
             for task in list(self._pending_tasks.values()):
                 task.cancel()
@@ -264,10 +306,51 @@ class DirectorySyncService:
             self._drain_raw_queue()
 
             self._root = Path(data_dir).resolve()
-            initial = await asyncio.to_thread(self._scan_directory, self._root)
-            self._known = initial or {}
+            self._known = {}
+            self._validation_cache.clear()
             if self._running:
                 await self._start_observer()
+                await self._prime_directory()
+
+    async def _prime_directory(self) -> None:
+        """Seed existing images through the same readiness gate as new files.
+
+        Take two directory samples once, then validate at most four files in
+        parallel. Incomplete files are retried in the background; they never
+        hold startup or a directory switch open for the stability timeout.
+        """
+        root, generation = self._root, self._generation
+        if root is None:
+            return
+        initial = await asyncio.to_thread(self._scan_directory, root)
+        if not initial:
+            return
+        await asyncio.sleep(self._stability_interval)
+
+        async def seed(previous: ImageRecord) -> None:
+            current = await asyncio.to_thread(self._read_record, previous.path, root)
+            if current is None:
+                return
+            valid = (
+                current.stamp.size > 0
+                and current.stamp == previous.stamp
+                and await self._validate_record(current, root)
+            )
+            if not self._running or generation != self._generation or root != self._root:
+                return
+            if valid:
+                key = self._id_key(current.image_id)
+                known = self._known.get(key)
+                self._known[key] = current
+                if known is None or known.stamp != current.stamp:
+                    self._publish(
+                        "created" if known is None else "modified",
+                        image_id=current.image_id,
+                    )
+            else:
+                self._put_raw_event(RawWatchEvent("created", generation, current.path))
+
+        await asyncio.gather(*(seed(record) for record in initial.values()))
 
     def subscribe(
         self, generation: int
@@ -346,6 +429,15 @@ class DirectorySyncService:
                     event = self._merge_events(previous, event)
                 self._pending_events[key] = event
                 previous_task = self._pending_tasks.get(key)
+                if (
+                    previous_task is not None
+                    and not previous_task.done()
+                    and (event.kind in {"created", "modified"} or previous == event)
+                ):
+                    # Probes already observe changing stamps. Restarting them
+                    # for every camera write or reconciliation scan can starve
+                    # an image indefinitely and adds unnecessary latency.
+                    continue
                 if previous_task is not None:
                     previous_task.cancel()
                 task = asyncio.create_task(
@@ -385,7 +477,7 @@ class DirectorySyncService:
     @staticmethod
     def _merge_events(previous: RawWatchEvent, current: RawWatchEvent) -> RawWatchEvent:
         # Preserve the most informative event across create/modify bursts.
-        if previous.kind in {"created", "moved"} and current.kind == "modified":
+        if previous.kind in {"created", "moved"} and current.kind in {"created", "modified"}:
             return previous
         if previous.kind == "deleted" and current.kind in {"created", "modified"}:
             return RawWatchEvent(
@@ -398,9 +490,11 @@ class DirectorySyncService:
 
     async def _debounced_process(self, key: str, event: RawWatchEvent) -> None:
         try:
-            await asyncio.sleep(self._debounce_seconds)
+            if event.kind != "deleted":
+                await asyncio.sleep(self._debounce_seconds)
             if not self._running or event.generation != self._generation:
                 return
+            event = self._pending_events.get(key, event)
             await self._process_event(event)
         except asyncio.CancelledError:
             raise
@@ -439,6 +533,7 @@ class DirectorySyncService:
         if image_id is None:
             return
         previous = self._known.pop(self._id_key(image_id), None)
+        self._validation_cache.pop(self._id_key(image_id), None)
         if previous is not None:
             self._publish("deleted", image_id=previous.image_id)
 
@@ -504,13 +599,67 @@ class DirectorySyncService:
             elif previous is not None and previous.stamp == record.stamp:
                 equal_samples += 1
                 if equal_samples >= self._stable_samples:
-                    return record
+                    if await self._validate_record(record, root):
+                        if generation == self._generation and root == self._root:
+                            return record
+                        return None
             else:
                 previous = record
                 equal_samples = 1
             await asyncio.sleep(self._stability_interval)
         LOGGER.warning("Image did not become stable before timeout: %s", path)
         return None
+
+    async def _validate_record(self, record: ImageRecord, root: Path) -> bool:
+        key = self._id_key(record.image_id)
+        loop = asyncio.get_running_loop()
+        async with self._validation_slots:
+            cached = self._validation_cache.get(key)
+            if cached is not None and cached[0] == record.stamp:
+                # Retry failures occasionally: a sharing violation can clear
+                # without changing metadata. Never repeatedly decode a large
+                # incomplete image at every stability probe.
+                if cached[1] or loop.time() - cached[2] < 2.0:
+                    current = await asyncio.to_thread(self._read_record, record.path, root)
+                    return cached[1] and current is not None and current.stamp == record.stamp
+            valid = await asyncio.to_thread(self._contents_complete, record, root)
+            if root == self._root:
+                self._validation_cache[key] = (record.stamp, valid, loop.time())
+            return valid
+
+    @classmethod
+    def _contents_complete(cls, record: ImageRecord, root: Path) -> bool:
+        """Validate the entire image, including all frames, off the event loop."""
+        try:
+            before = cls._read_record(record.path, root)
+            if before is None or before.stamp != record.stamp:
+                return False
+            # verify() checks container checksums where supported. JPEG verify
+            # alone only reads headers, so load() is essential for paused writes
+            # with a complete header but truncated pixel data or a missing EOI.
+            with Image.open(record.path) as candidate:
+                image_format = candidate.format
+                candidate.verify()
+            # Pillow can accept PNGs missing the last IEND checksum bytes and
+            # GIFs missing their trailer, even with strict pixel decoding.
+            # Require the container's closing marker before publishing them.
+            trailer = {
+                "PNG": b"\x00\x00\x00\x00IEND\xaeB\x60\x82",
+                "GIF": b";",
+            }.get(image_format)
+            if trailer is not None:
+                with record.path.open("rb") as source:
+                    source.seek(-len(trailer), os.SEEK_END)
+                    if source.read(len(trailer)) != trailer:
+                        return False
+            with Image.open(record.path) as candidate:
+                for frame in range(getattr(candidate, "n_frames", 1)):
+                    candidate.seek(frame)
+                    candidate.load()
+            after = cls._read_record(record.path, root)
+            return after is not None and after.stamp == record.stamp
+        except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError):
+            return False
 
     async def _reconcile_loop(self) -> None:
         try:

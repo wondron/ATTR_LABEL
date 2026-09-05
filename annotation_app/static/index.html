@@ -69,6 +69,8 @@
           </label>
         </div>
 
+        <button type="button" class="button button--secondary download-button" id="downloadAnnotatedButton" aria-busy="false" title="下载当前文件夹已保存的有效标注及原图" disabled>下载已标注数据</button>
+
         <div class="image-list" id="imageList" role="listbox" aria-label="图像文件">
           <div class="list-placeholder" id="listPlaceholder">
             <span class="spinner" aria-hidden="true"></span>
@@ -118,7 +120,7 @@
           <button type="button" class="button button--ghost" id="previousButton" disabled>
             <span aria-hidden="true">←</span> 上一张
           </button>
-          <div class="shortcut-hint">Q 上一张 · W 下一张</div>
+          <button type="button" class="button button--danger button--compact" id="deleteImageButton" title="删除当前图像（D）" aria-keyshortcuts="D" disabled>删除当前图像</button>
           <button type="button" class="button button--ghost" id="nextButton" disabled>
             下一张 <span aria-hidden="true">→</span>
           </button>
