@@ -367,6 +367,7 @@ def create_app(
     data_dir: str | Path | None = None,
     *,
     allowed_data_roots: tuple[str | Path, ...] | None = None,
+    wait_for_initial_scan: bool = True,
 ) -> FastAPI:
     repository = AnnotationRepository(data_dir or DEFAULT_DATA_DIR)
     if allowed_data_roots is None:
@@ -383,6 +384,7 @@ def create_app(
         await directory_sync.start(
             repository.data_dir,
             application.state.directory_generation,
+            wait_for_initial_scan=wait_for_initial_scan,
         )
         try:
             yield
@@ -963,20 +965,24 @@ def create_app(
         }
 
     @app.get("/api/v1/health")
-    async def get_health() -> dict[str, Any]:
+    async def get_health(response: Response) -> dict[str, Any]:
         current_repository = repository
         current_generation = app.state.directory_generation
         exists = current_repository.data_dir.is_dir()
         readable = os.access(current_repository.data_dir, os.R_OK)
         writable = os.access(current_repository.data_dir, os.W_OK)
-        healthy = exists and readable and writable
+        searchable = os.access(current_repository.data_dir, os.X_OK)
+        healthy = exists and readable and writable and searchable
+        response.status_code = 200 if healthy else 503
         return {
             "status": "ok" if healthy else "degraded",
             "data_dir": current_repository.data_dir.as_posix(),
             "directory_generation": current_generation,
+            "initial_scan_complete": directory_sync.initial_scan_complete,
             "data_dir_exists": exists,
             "data_dir_readable": readable,
             "data_dir_writable": writable,
+            "data_dir_searchable": searchable,
         }
 
     @app.get("/", include_in_schema=False, response_model=None)

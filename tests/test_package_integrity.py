@@ -48,6 +48,8 @@ class LinuxPackageIntegrityTests(unittest.TestCase):
         self.assertIn("nohup /usr/bin/env bash", restart)
         self.assertIn("annotation.pid", restart)
         self.assertIn("annotation.log", restart)
+        self.assertIn("HEALTH_DEADLINE=$((SECONDS + WAIT_SECONDS))", restart)
+        self.assertIn("curl 错误：${HEALTH_ERROR}", restart)
         self.assertIn("/root/miniconda3/envs/wondron/bin/python3", restart)
         self.assertIn('LABEL_HOST="${LABEL_HOST:-0.0.0.0}"', restart)
         self.assertIn('LABEL_PORT="${LABEL_PORT:-8577}"', restart)
@@ -55,6 +57,7 @@ class LinuxPackageIntegrityTests(unittest.TestCase):
         self.assertIn('PORT="${LABEL_PORT:-8577}"', start)
         self.assertIn('DEFAULT_HOST = "0.0.0.0"', launcher)
         self.assertIn("DEFAULT_PORT = 8577", launcher)
+        self.assertIn("wait_for_initial_scan=False", launcher)
 
     def test_readme_documents_nohup_and_remote_access(self) -> None:
         readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")

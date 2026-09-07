@@ -51,7 +51,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 1 <= args.port <= 65535:
         parser.error("--port 必须在 1 到 65535 之间。")
 
-    application = create_app(data_dir=args.data_dir)
+    application = create_app(data_dir=args.data_dir, wait_for_initial_scan=False)
     url = _browser_url(args.host, args.port)
     if not args.no_browser:
         timer = threading.Timer(1.0, webbrowser.open, args=(url,))

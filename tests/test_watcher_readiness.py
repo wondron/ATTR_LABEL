@@ -184,6 +184,124 @@ class WatcherReadinessTests(unittest.IsolatedAsyncioTestCase):
             await service.switch_directory(new_directory, 2)
         self.assertEqual(service.ready_snapshot(2), {})
 
+    async def test_background_initial_scan_can_finish_after_start_returns(self) -> None:
+        picture = self.directory / "existing.jpg"
+        picture.write_bytes(image_bytes())
+        service = polling_service()
+        self.services.append(service)
+        scan_started = asyncio.Event()
+        release_scan = asyncio.Event()
+        prime_directory = service._prime_directory
+
+        async def delayed_prime() -> None:
+            scan_started.set()
+            await release_scan.wait()
+            await prime_directory()
+
+        with patch.object(service, "_prime_directory", side_effect=delayed_prime):
+            await service.start(
+                self.directory,
+                1,
+                wait_for_initial_scan=False,
+            )
+            await asyncio.wait_for(scan_started.wait(), timeout=1)
+            self.assertFalse(service.initial_scan_complete)
+            self.assertEqual(service.ready_snapshot(1), {})
+
+            release_scan.set()
+            deadline = asyncio.get_running_loop().time() + 2
+            while not service.initial_scan_complete:
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("后台初始图片扫描未按时完成。")
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(set(service.ready_snapshot(1)), {picture.name})
+
+    async def test_stop_cancels_background_initial_scan(self) -> None:
+        service = polling_service()
+        self.services.append(service)
+        scan_started = asyncio.Event()
+        scan_cancelled = asyncio.Event()
+
+        async def blocked_prime() -> None:
+            scan_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                scan_cancelled.set()
+                raise
+
+        with patch.object(service, "_prime_directory", side_effect=blocked_prime):
+            await service.start(
+                self.directory,
+                1,
+                wait_for_initial_scan=False,
+            )
+            await asyncio.wait_for(scan_started.wait(), timeout=1)
+            await asyncio.wait_for(service.stop(), timeout=1)
+
+        self.assertTrue(scan_cancelled.is_set())
+        self.assertFalse(service.initial_scan_complete)
+        self.assertIsNone(service._prime_task)
+        self.assertIsNone(service._reconcile_task)
+
+    async def test_switch_cancels_old_background_scan_before_priming_new_directory(self) -> None:
+        service = polling_service()
+        self.services.append(service)
+        old_scan_started = asyncio.Event()
+        old_scan_cancelled = asyncio.Event()
+        prime_directory = service._prime_directory
+        new_directory = self.directory / "new"
+        new_directory.mkdir()
+        new_picture = new_directory / "new.jpg"
+        new_picture.write_bytes(image_bytes())
+
+        async def controlled_prime() -> None:
+            if service.generation == 1:
+                old_scan_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    old_scan_cancelled.set()
+                    raise
+            await prime_directory()
+
+        with patch.object(service, "_prime_directory", side_effect=controlled_prime):
+            await service.start(
+                self.directory,
+                1,
+                wait_for_initial_scan=False,
+            )
+            await asyncio.wait_for(old_scan_started.wait(), timeout=1)
+            await asyncio.wait_for(
+                service.switch_directory(new_directory, 2),
+                timeout=2,
+            )
+
+        self.assertTrue(old_scan_cancelled.is_set())
+        self.assertTrue(service.initial_scan_complete)
+        self.assertEqual(set(service.ready_snapshot(2)), {new_picture.name})
+
+    async def test_switch_scan_failure_still_restores_reconciliation(self) -> None:
+        service = await self.start_service()
+        new_directory = self.directory / "new"
+        new_directory.mkdir()
+
+        async def fail_prime() -> None:
+            raise RuntimeError("simulated initial scan failure")
+
+        with (
+            patch.object(service, "_prime_directory", side_effect=fail_prime),
+            patch("annotation_app.watcher.LOGGER.exception") as log_exception,
+        ):
+            await service.switch_directory(new_directory, 2)
+            await asyncio.sleep(0)
+
+        self.assertFalse(service.initial_scan_complete)
+        self.assertIsNotNone(service._reconcile_task)
+        self.assertFalse(service._reconcile_task.done())
+        log_exception.assert_called_once_with("Initial image directory scan failed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,7 +88,9 @@ cd /models/wangzhuo/01-code/03_deploy/label_mulAtti
 ./restart.sh /实际/标注数据目录
 ```
 
-脚本把 PID 写入 `annotation.pid`，日志写入 `annotation.log`，并检查 `/api/v1/health`。首次从旧版本迁移时，如果检测到原来的 systemd 服务，脚本会请求 `sudo` 并一次性将其停用，以免占用同一端口。后续启动不需要 `sudo`。
+脚本把 PID 写入 `annotation.pid`，日志写入 `annotation.log`，并检查 `/api/v1/health`。首次从旧版本迁移时，如果检测到原来的 systemd 服务，脚本会请求 `sudo` 并一次性将其停用，以免占用同一端口。后续启动不需要 `sudo`。服务开始监听后会在后台校验已有图片，健康响应中的 `initial_scan_complete` 表示这次初始校验是否完成；该值为 `false` 时接口已经可用，图片会随着校验通过逐步出现在页面中。
+
+健康接口在数据目录不存在、不可读、不可写或不可进入时返回 HTTP `503` 和 `status: "degraded"`。`restart.sh` 的等待时间是真实墙钟时间，超时时会直接显示最后一次 `curl` 错误和最近 40 行服务日志。
 
 验证当前实际读取的数据目录：
 
@@ -206,6 +208,7 @@ http://118.31.105.171:8577/
 | `LABEL_HOST` | `0.0.0.0` | 监听所有服务器网卡，供其他电脑连接 |
 | `LABEL_PORT` | `8577` | 服务端口 |
 | `LABEL_ALLOWED_DATA_ROOTS` | 空（仅初始目录） | 网页允许切换的数据根目录；多个路径用 `:` 分隔。空值不会开放整个文件系统 |
+| `WAIT_SECONDS` | `20` | `restart.sh` 等待健康接口的最长秒数 |
 
 也可以绕过启动脚本直接运行：
 

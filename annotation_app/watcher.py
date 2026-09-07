@@ -161,6 +161,7 @@ class DirectorySyncService:
         self._running = False
         self._observer: Any | None = None
         self._consumer_task: asyncio.Task[None] | None = None
+        self._prime_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
         self._pending_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_events: dict[str, RawWatchEvent] = {}
@@ -172,6 +173,7 @@ class DirectorySyncService:
         ] = {}
         self._next_subscriber_id = 0
         self._sequence = 0
+        self._initial_scan_complete = False
         self._control_lock = asyncio.Lock()
 
     @property
@@ -181,6 +183,10 @@ class DirectorySyncService:
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def initial_scan_complete(self) -> bool:
+        return self._initial_scan_complete
 
     def ready_snapshot(
         self, generation: int | None = None,
@@ -222,7 +228,13 @@ class DirectorySyncService:
         except Exception:  # pragma: no cover - defensive third-party boundary.
             return False
 
-    async def start(self, data_dir: str | Path, generation: int) -> None:
+    async def start(
+        self,
+        data_dir: str | Path,
+        generation: int,
+        *,
+        wait_for_initial_scan: bool = True,
+    ) -> None:
         async with self._control_lock:
             if self._running:
                 return
@@ -233,39 +245,54 @@ class DirectorySyncService:
             self._generation = generation
             self._known = {}
             self._validation_cache.clear()
+            self._initial_scan_complete = False
             self._consumer_task = asyncio.create_task(
                 self._consume_events(), name="annotation-directory-events"
             )
+            await self._start_observer()
+            if wait_for_initial_scan:
+                await self._prime_directory()
+                self._initial_scan_complete = True
+            else:
+                root, current_generation = self._root, self._generation
+                self._prime_task = asyncio.create_task(
+                    self._run_initial_scan(root, current_generation),
+                    name="annotation-directory-initial-scan",
+                )
             self._reconcile_task = asyncio.create_task(
                 self._reconcile_loop(), name="annotation-directory-reconcile"
             )
-            await self._start_observer()
-            await self._prime_directory()
 
     async def stop(self) -> None:
         async with self._control_lock:
             if not self._running:
                 return
             self._running = False
-            await self._stop_observer()
-            for task in list(self._pending_tasks.values()):
-                task.cancel()
+            self._root = None
+            self._initial_scan_complete = False
+            pending = list(self._pending_tasks.values())
             background = [
                 task
-                for task in (self._consumer_task, self._reconcile_task)
+                for task in (
+                    self._consumer_task,
+                    self._prime_task,
+                    self._reconcile_task,
+                )
                 if task is not None
             ]
-            for task in background:
+            self._consumer_task = None
+            self._prime_task = None
+            self._reconcile_task = None
+            for task in (*pending, *background):
                 task.cancel()
-            if self._pending_tasks or background:
+            await self._stop_observer()
+            if pending or background:
                 await asyncio.gather(
-                    *self._pending_tasks.values(), *background,
+                    *pending, *background,
                     return_exceptions=True,
                 )
             self._pending_tasks.clear()
             self._pending_events.clear()
-            self._consumer_task = None
-            self._reconcile_task = None
             self._raw_queue = None
             self._loop = None
             self._known.clear()
@@ -294,12 +321,21 @@ class DirectorySyncService:
             self._root = None
             self._known.clear()
             self._validation_cache.clear()
-            await self._stop_observer()
-            for task in list(self._pending_tasks.values()):
+            self._initial_scan_complete = False
+            scan_tasks = [
+                task
+                for task in (self._prime_task, self._reconcile_task)
+                if task is not None
+            ]
+            self._prime_task = None
+            self._reconcile_task = None
+            pending = list(self._pending_tasks.values())
+            for task in (*scan_tasks, *pending):
                 task.cancel()
-            if self._pending_tasks:
+            await self._stop_observer()
+            if scan_tasks or pending:
                 await asyncio.gather(
-                    *self._pending_tasks.values(), return_exceptions=True
+                    *scan_tasks, *pending, return_exceptions=True
                 )
             self._pending_tasks.clear()
             self._pending_events.clear()
@@ -310,7 +346,38 @@ class DirectorySyncService:
             self._validation_cache.clear()
             if self._running:
                 await self._start_observer()
-                await self._prime_directory()
+                root, current_generation = self._root, self._generation
+                self._prime_task = asyncio.create_task(
+                    self._run_initial_scan(root, current_generation),
+                    name="annotation-directory-initial-scan",
+                )
+                self._reconcile_task = asyncio.create_task(
+                    self._reconcile_loop(), name="annotation-directory-reconcile"
+                )
+                await asyncio.shield(self._prime_task)
+
+    async def _run_initial_scan(
+        self,
+        root: Path | None,
+        generation: int,
+    ) -> None:
+        task = asyncio.current_task()
+        try:
+            await self._prime_directory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Initial image directory scan failed")
+            if self._running and root == self._root and generation == self._generation:
+                self._publish("resync", details={"reason": "initial_scan_error"})
+        else:
+            if (
+                self._running
+                and root == self._root
+                and generation == self._generation
+                and task is self._prime_task
+            ):
+                self._initial_scan_complete = True
 
     async def _prime_directory(self) -> None:
         """Seed existing images through the same readiness gate as new files.
@@ -326,29 +393,31 @@ class DirectorySyncService:
         if not initial:
             return
         await asyncio.sleep(self._stability_interval)
+        seed_slots = asyncio.Semaphore(4)
 
         async def seed(previous: ImageRecord) -> None:
-            current = await asyncio.to_thread(self._read_record, previous.path, root)
-            if current is None:
-                return
-            valid = (
-                current.stamp.size > 0
-                and current.stamp == previous.stamp
-                and await self._validate_record(current, root)
-            )
-            if not self._running or generation != self._generation or root != self._root:
-                return
-            if valid:
-                key = self._id_key(current.image_id)
-                known = self._known.get(key)
-                self._known[key] = current
-                if known is None or known.stamp != current.stamp:
-                    self._publish(
-                        "created" if known is None else "modified",
-                        image_id=current.image_id,
-                    )
-            else:
-                self._put_raw_event(RawWatchEvent("created", generation, current.path))
+            async with seed_slots:
+                current = await asyncio.to_thread(self._read_record, previous.path, root)
+                if current is None:
+                    return
+                valid = (
+                    current.stamp.size > 0
+                    and current.stamp == previous.stamp
+                    and await self._validate_record(current, root)
+                )
+                if not self._running or generation != self._generation or root != self._root:
+                    return
+                if valid:
+                    key = self._id_key(current.image_id)
+                    known = self._known.get(key)
+                    self._known[key] = current
+                    if known is None or known.stamp != current.stamp:
+                        self._publish(
+                            "created" if known is None else "modified",
+                            image_id=current.image_id,
+                        )
+                else:
+                    self._put_raw_event(RawWatchEvent("created", generation, current.path))
 
         await asyncio.gather(*(seed(record) for record in initial.values()))
 
@@ -663,6 +732,12 @@ class DirectorySyncService:
 
     async def _reconcile_loop(self) -> None:
         try:
+            initial_scan = self._prime_task
+            if initial_scan is not None:
+                await asyncio.shield(initial_scan)
+                if not self._running:
+                    return
+                await self._reconcile_once()
             while self._running:
                 interval = (
                     self._observer_reconcile_interval

@@ -106,29 +106,47 @@ case "${HEALTH_HOST}" in
 esac
 HEALTH_URL="http://${HEALTH_HOST}:${LABEL_PORT}/api/v1/health"
 
-for ((second = 1; second <= WAIT_SECONDS; second++)); do
-  if ! kill -0 "${NEW_PID}" 2>/dev/null; then
-    rm -f -- "${PID_FILE}"
-    echo "启动失败，最近日志如下：" >&2
+show_startup_failure() {
+  rm -f -- "${PID_FILE}"
+  echo "启动失败，最近日志如下：" >&2
+  tail -n 40 "${LOG_FILE}" >&2 || true
+  exit 1
+}
+
+if ! command -v curl >/dev/null 2>&1; then
+  sleep 1
+  kill -0 "${NEW_PID}" 2>/dev/null || show_startup_failure
+  echo "警告：未安装 curl，已跳过 HTTP 健康检查。" >&2
+else
+  HEALTH_DEADLINE=$((SECONDS + WAIT_SECONDS))
+  HEALTH_PASSED=0
+  HEALTH_ERROR=""
+  while (( SECONDS < HEALTH_DEADLINE )); do
+    if ! kill -0 "${NEW_PID}" 2>/dev/null; then
+      show_startup_failure
+    fi
+
+    if HEALTH_OUTPUT="$(
+      curl --noproxy '*' -fsS --connect-timeout 2 --max-time 2 \
+        "${HEALTH_URL}" 2>&1
+    )"; then
+      HEALTH_PASSED=1
+      break
+    fi
+    HEALTH_ERROR="${HEALTH_OUTPUT}"
+    if (( SECONDS < HEALTH_DEADLINE )); then
+      sleep 1
+    fi
+  done
+
+  if (( ! HEALTH_PASSED )); then
+    kill -0 "${NEW_PID}" 2>/dev/null || show_startup_failure
+    echo "进程 ${NEW_PID} 仍在运行，但健康检查在 ${WAIT_SECONDS} 秒内未通过：${HEALTH_URL}" >&2
+    [[ -z "${HEALTH_ERROR}" ]] || echo "curl 错误：${HEALTH_ERROR}" >&2
+    echo "最近日志如下：" >&2
     tail -n 40 "${LOG_FILE}" >&2 || true
     exit 1
   fi
-
-  if command -v curl >/dev/null 2>&1; then
-    if curl --noproxy '*' -fsS --max-time 2 "${HEALTH_URL}" >/dev/null 2>&1; then
-      break
-    fi
-  elif (( second >= 2 )); then
-    break
-  fi
-  sleep 1
-done
-
-if command -v curl >/dev/null 2>&1 &&
-   ! curl --noproxy '*' -fsS --max-time 2 "${HEALTH_URL}" >/dev/null 2>&1; then
-  echo "进程 ${NEW_PID} 已在后台运行，但健康检查暂未通过：${HEALTH_URL}" >&2
-  echo "请查看日志：tail -f '${LOG_FILE}'" >&2
-  exit 1
 fi
 
 echo "启动成功，PID：${NEW_PID}"

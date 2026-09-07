@@ -1,2 +1,5 @@
 __pycache__/
 10-temp_label/*
+annotation.log
+annotation.pid
+.vscode/
