@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_DIR = "/data/wangzhuo/66-newdata/00-dataset"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "10-temp_label"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ANNOTATION_VERSION = "1.6"
 MISSING_REVISION = "__missing__"

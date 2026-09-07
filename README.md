@@ -10,21 +10,26 @@
 
 ## 安装
 
-当前服务器上的项目目录为：
-
-```text
-/models/wangzhuo/01-code/03_deploy/label_mulAtti
-```
-
-首次安装执行：
+项目目录由启动脚本根据自身位置自动识别，不需要写进服务器配置。首次安装执行：
 
 ```bash
-cd /models/wangzhuo/01-code/03_deploy/label_mulAtti
-/root/miniconda3/envs/wondron/bin/python3 -m pip install -r requirements.txt
+cd /项目实际路径/label_mulAtti
 chmod +x start.sh restart.sh
+cp -n .env.example .env
+
+# 编辑 .env 后，使用其中配置的 Conda 环境安装依赖
+set -a
+source ./.env
+set +a
+if [[ -n "$CONDA_ENV_NAME" ]]; then
+  "$CONDA_BASE_DIR/bin/conda" run -n "$CONDA_ENV_NAME" \
+    python -m pip install -r requirements.txt
+else
+  python3 -m pip install -r requirements.txt
+fi
 ```
 
-`restart.sh` 默认优先使用 `/root/miniconda3/envs/wondron/bin/python3`，找不到时使用 `python3`。它通过 `nohup` 在后台运行服务，SSH 断开后进程仍会继续运行。
+`start.sh` 和 `restart.sh` 都会读取项目根目录的 `.env`，并使用配置的 Conda 环境。`restart.sh` 通过 `nohup` 在后台运行服务，SSH 断开后进程仍会继续运行。
 
 复制或挂载数据后，可以先做只读检查：
 
@@ -32,7 +37,7 @@ chmod +x start.sh restart.sh
 python3 verify_package.py /data/label-data
 ```
 
-## 当前服务器推荐方案
+## 推荐部署方案
 
 由于标注数据目录会经常变化，推荐使用：
 
@@ -47,7 +52,7 @@ nohup 后台进程 → 固定入口 current_label_data → 当前实际数据目
 把 `/实际/标注数据目录` 替换成图片和同名 JSON 所在的目录：
 
 ```bash
-PROJECT_DIR=/models/wangzhuo/01-code/03_deploy/label_mulAtti
+PROJECT_DIR=/项目实际路径/label_mulAtti
 DATA_DIR=/实际/标注数据目录
 
 test -d "$DATA_DIR"
@@ -57,28 +62,35 @@ readlink -f "$PROJECT_DIR/current_label_data"
 
 `current_label_data` 必须是软链接；如果该位置已经存在真实文件或真实目录，`ln` 会失败，此时不要强制删除，应先检查里面是否有数据。
 
-### 2. 创建服务环境配置
+### 2. 修改服务器配置
 
-当前服务器允许网页选择 `/models/wangzhuo/01-code/03_deploy` 及其全部子目录：
+`.env` 不提交到 Git。每台服务器从模板复制一份后修改：
 
 ```bash
-sudo tee /etc/default/multi-attribute-label > /dev/null <<'EOF'
-PYTHON_BIN=/root/miniconda3/envs/wondron/bin/python3
-LABEL_DATA_DIR=/models/wangzhuo/01-code/03_deploy/label_mulAtti/current_label_data
-LABEL_ALLOWED_DATA_ROOTS=/models/wangzhuo/01-code/03_deploy
-LABEL_HOST=0.0.0.0
-LABEL_PORT=8577
-EOF
+cp -n .env.example .env
 ```
 
-`LABEL_ALLOWED_DATA_ROOTS` 限制网页只能切换到该目录及其子目录，不要设置成 `/`。多个数据根目录使用英文冒号分隔，例如 `LABEL_ALLOWED_DATA_ROOTS=/models/wangzhuo/01-code/03_deploy:/data/label-tasks`。修改此配置文件后重新执行 `./restart.sh` 即可生效。
+然后编辑 `.env`，例如：
+
+```dotenv
+CONDA_BASE_DIR=/root/miniconda3
+CONDA_ENV_NAME=wondron
+LABEL_DATA_DIR=/实际项目路径/label_mulAtti/current_label_data
+LABEL_ALLOWED_DATA_ROOTS=/允许浏览的数据根目录
+LABEL_HOST=0.0.0.0
+LABEL_PORT=8577
+```
+
+第一个启动参数可临时覆盖数据目录，例如 `./restart.sh /本次使用的数据目录`。需要使用其他配置文件时可设置 `ENV_FILE=/其他路径/.env`。`.env` 会被 Bash `source`，只写简单的 `KEY=value`，路径含空格时加双引号，不要在其中执行命令。
+
+`LABEL_ALLOWED_DATA_ROOTS` 限制网页只能切换到该目录及其子目录，不要设置成 `/`。多个数据根目录使用英文冒号分隔，例如 `/data/label-tasks:/mnt/label-archive`。修改配置后重新执行 `./restart.sh` 即可生效。Conda 环境名配置为空时，脚本改用 `PATH` 中的 `python3`；也可以用 `PYTHON_BIN` 直接指定虚拟环境或系统 Python。
 
 ### 3. 使用 nohup 启动或重启
 
 使用包内的 `restart.sh` 停止旧进程并通过 `nohup` 后台启动：
 
 ```bash
-cd /models/wangzhuo/01-code/03_deploy/label_mulAtti
+cd /项目实际路径/label_mulAtti
 ./restart.sh
 ```
 
@@ -88,7 +100,7 @@ cd /models/wangzhuo/01-code/03_deploy/label_mulAtti
 ./restart.sh /实际/标注数据目录
 ```
 
-脚本把 PID 写入 `annotation.pid`，日志写入 `annotation.log`，并检查 `/api/v1/health`。首次从旧版本迁移时，如果检测到原来的 systemd 服务，脚本会请求 `sudo` 并一次性将其停用，以免占用同一端口。后续启动不需要 `sudo`。服务开始监听后会在后台校验已有图片，健康响应中的 `initial_scan_complete` 表示这次初始校验是否完成；该值为 `false` 时接口已经可用，图片会随着校验通过逐步出现在页面中。
+脚本把 PID 写入 `annotation.pid`，日志写入 `annotation.log`，并检查 `/api/v1/health`。服务开始监听后会在后台校验已有图片，健康响应中的 `initial_scan_complete` 表示这次初始校验是否完成；该值为 `false` 时接口已经可用，图片会随着校验通过逐步出现在页面中。
 
 健康接口在数据目录不存在、不可读、不可写或不可进入时返回 HTTP `503` 和 `status: "degraded"`。`restart.sh` 的等待时间是真实墙钟时间，超时时会直接显示最后一次 `curl` 错误和最近 40 行服务日志。
 
@@ -109,18 +121,18 @@ curl -fsS http://127.0.0.1:8577/api/v1/config | python3 -m json.tool
 3. 使用“上一级”、面包屑或“刷新”浏览目录。
 4. 确认“当前选择”正确后，点击“选择此文件夹”。
 
-弹窗也保留了“地址”输入栏；已知服务器绝对路径时，可直接输入 `/models/wangzhuo/01-code/03_deploy/label-task-20260813` 并点击“转到”。
+弹窗也保留了“地址”输入栏；已知服务器绝对路径时，可直接输入 `/data/label-tasks/task-20260813` 并点击“转到”。
 
 目录必须已经存在，位于 `LABEL_ALLOWED_DATA_ROOTS` 配置的根目录内，并且运行服务的用户拥有读取、写入和进入目录的权限。这里输入的是服务器路径，不是操作电脑上的本地路径。
 
 切换对当前运行的服务进程全局生效。其他已经打开的标注页面会停止读写并提示刷新，防止写入错误目录；因此切换前应确认所有页面的当前标注均已保存。
 
-网页切换不会修改 `current_label_data` 软链接或 `/etc/default`，所以服务重启后会回到配置的初始目录。需要让新目录在重启后仍然生效时，请使用下面的命令行方式更新软链接。
+网页切换不会修改 `current_label_data` 软链接或 `.env`，所以服务重启后会回到配置的初始目录。需要让新目录在重启后仍然生效时，请使用下面的命令行方式更新软链接。
 
 也可以在服务器命令行更新软链接并重启服务：
 
 ```bash
-PROJECT_DIR=/models/wangzhuo/01-code/03_deploy/label_mulAtti
+PROJECT_DIR=/项目实际路径/label_mulAtti
 NEW_DATA_DIR=/新的/标注数据目录
 
 # 确认新目录存在且当前用户可以读写
@@ -147,19 +159,19 @@ curl -fsS http://127.0.0.1:8577/api/v1/config | python3 -m json.tool
 服务默认监听 `0.0.0.0:8577`。多台电脑可以直接在浏览器中访问：
 
 ```text
-http://118.31.105.171:8577/
+http://<服务器IP>:<LABEL_PORT>/
 ```
 
 服务器安全组和防火墙需要放行 TCP 8577。建议仅允许需要使用标注工具的固定公网 IP 或可信内网网段访问。
 
-确认 `/etc/default/multi-attribute-label` 中包含：
+确认 `.env` 中包含正确的监听配置：
 
 ```text
 LABEL_HOST=0.0.0.0
 LABEL_PORT=8577
 ```
 
-环境配置修改后重新执行启动脚本：
+配置修改后重新执行启动脚本：
 
 ```bash
 ./restart.sh
@@ -194,20 +206,23 @@ LABEL_HOST=0.0.0.0 LABEL_PORT=8577 ./start.sh /data/label-data
 浏览器访问：
 
 ```text
-http://118.31.105.171:8577/
+http://<服务器IP>:<LABEL_PORT>/
 ```
 
 从其他电脑访问时使用同一地址。若无法连接，请确认云服务器安全组和系统防火墙已对这些电脑的来源 IP 放行 TCP 8577。
 
-可用环境变量：
+`.env` 配置项与额外环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PYTHON_BIN` | `python3` | Python 命令 |
+| `ENV_FILE` | `.env` | 可指定其他 `.env` 文件 |
+| `CONDA_BASE_DIR` | `/root/miniconda3` | Conda 安装目录 |
+| `CONDA_ENV_NAME` | `wondron` | Conda 环境名；配置为空时使用 `PATH` 中的 `python3` |
+| `PYTHON_BIN` | 由 Conda 配置解析 | 直接指定 Python 时优先于 Conda 配置 |
 | `LABEL_DATA_DIR` | `10-temp_label` | 未传第一个参数时使用的数据目录 |
 | `LABEL_HOST` | `0.0.0.0` | 监听所有服务器网卡，供其他电脑连接 |
 | `LABEL_PORT` | `8577` | 服务端口 |
-| `LABEL_ALLOWED_DATA_ROOTS` | 空（仅初始目录） | 网页允许切换的数据根目录；多个路径用 `:` 分隔。空值不会开放整个文件系统 |
+| `LABEL_ALLOWED_DATA_ROOTS` | 空（仅初始目录） | 网页允许切换的数据根目录；多个路径用 `:` 分隔。不要设置为 `/` |
 | `WAIT_SECONDS` | `20` | `restart.sh` 等待健康接口的最长秒数 |
 
 也可以绕过启动脚本直接运行：
@@ -225,7 +240,7 @@ python3 run_annotation_ui.py \
 启动或重启统一执行：
 
 ```bash
-cd /models/wangzhuo/01-code/03_deploy/label_mulAtti
+cd /项目实际路径/label_mulAtti
 ./restart.sh
 ```
 

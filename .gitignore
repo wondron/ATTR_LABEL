@@ -3,3 +3,4 @@ __pycache__/
 annotation.log
 annotation.pid
 .vscode/
+.env
