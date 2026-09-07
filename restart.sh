@@ -26,7 +26,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   if [[ -x /root/miniconda3/envs/wondron/bin/python3 ]]; then
     PYTHON_BIN=/root/miniconda3/envs/wondron/bin/python3
   else
-    PYTHON_BIN=python3
+    PYTHON_BIN=/root/miniconda3/envs/mainfooddtct/bin/python3
   fi
 fi
 
