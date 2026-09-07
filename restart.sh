@@ -25,8 +25,13 @@ fi
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if [[ -x /root/miniconda3/envs/wondron/bin/python3 ]]; then
     PYTHON_BIN=/root/miniconda3/envs/wondron/bin/python3
-  else
+  elif [[ -x /root/miniconda3/envs/mainfooddtct/bin/python3 ]]; then
     PYTHON_BIN=/root/miniconda3/envs/mainfooddtct/bin/python3
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python3)
+  else
+    echo "ERROR: python3 not found"
+    exit 1
   fi
 fi
 
