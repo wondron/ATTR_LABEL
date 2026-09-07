@@ -4,3 +4,4 @@ annotation.log
 annotation.pid
 .vscode/
 .env
+.nfs*

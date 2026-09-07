@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from annotation_app.config import MISSING_REVISION
-from annotation_app.main import create_app
+from annotation_app.main import CLIENT_SESSION_COOKIE, create_app
 
 
 def switch_payload(path: Path | str, generation: int = 0) -> dict[str, object]:
@@ -51,6 +51,113 @@ def browse_directories(
 
 
 class LinuxDirectorySwitchTests(unittest.TestCase):
+    def test_browser_sessions_switch_directories_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            initial_dir = root / "默认目录"
+            computer_a_dir = root / "0904"
+            computer_b_dir = root / "小倩采集"
+            for directory, filename, color in (
+                (initial_dir, "initial.jpg", "red"),
+                (computer_a_dir, "computer-a.jpg", "green"),
+                (computer_b_dir, "computer-b.jpg", "blue"),
+            ):
+                directory.mkdir()
+                Image.new("RGB", (8, 8), color).save(directory / filename)
+
+            with TestClient(
+                create_app(initial_dir, allowed_data_roots=(root,))
+            ) as client:
+                first_config = client.get("/api/v1/config")
+                session_a = first_config.cookies.get(CLIENT_SESSION_COOKIE)
+                self.assertIsNotNone(session_a)
+                set_cookie = first_config.headers["set-cookie"].lower()
+                self.assertIn("httponly", set_cookie)
+                self.assertIn("path=/", set_cookie)
+                self.assertIn("samesite=lax", set_cookie)
+
+                client.cookies.clear()
+                second_config = client.get("/api/v1/config")
+                session_b = second_config.cookies.get(CLIENT_SESSION_COOKIE)
+                self.assertIsNotNone(session_b)
+                self.assertNotEqual(session_a, session_b)
+                self.assertEqual(
+                    second_config.json()["data_dir"],
+                    initial_dir.as_posix(),
+                )
+                self.assertEqual(second_config.json()["directory_generation"], 0)
+
+                def use_session(session_id: str) -> None:
+                    client.cookies.clear()
+                    client.cookies.set(CLIENT_SESSION_COOKIE, session_id)
+
+                use_session(session_a)
+                switched_a = switch_directory(client, computer_a_dir)
+                self.assertEqual(switched_a.status_code, 200, switched_a.text)
+                self.assertEqual(switched_a.json()["directory_generation"], 1)
+
+                use_session(session_b)
+                unchanged_b = client.get("/api/v1/config")
+                self.assertEqual(
+                    unchanged_b.json()["data_dir"],
+                    initial_dir.as_posix(),
+                )
+                self.assertEqual(unchanged_b.json()["directory_generation"], 0)
+                images_b = client.get(
+                    "/api/v1/images",
+                    params={"directory_generation": 0},
+                )
+                self.assertEqual(images_b.status_code, 200, images_b.text)
+                self.assertEqual(
+                    [item["image_id"] for item in images_b.json()["items"]],
+                    ["initial.jpg"],
+                )
+                saved_b = client.put(
+                    "/api/v1/annotation",
+                    params={
+                        "directory_generation": 0,
+                        "image_id": "initial.jpg",
+                    },
+                    json={
+                        "revision": MISSING_REVISION,
+                        "annotations": {
+                            "food_name": "小倩",
+                            "food_count": 1,
+                            "quality": 100.0,
+                            "device_model": None,
+                            "container_type": ["无"],
+                            "accessory_type": ["无"],
+                            "rack_level": ["无"],
+                            "food_size": None,
+                        },
+                    },
+                )
+                self.assertEqual(saved_b.status_code, 200, saved_b.text)
+                self.assertTrue((initial_dir / "initial.json").is_file())
+                self.assertFalse((computer_a_dir / "initial.json").exists())
+
+                switched_b = switch_directory(client, computer_b_dir)
+                self.assertEqual(switched_b.status_code, 200, switched_b.text)
+                self.assertEqual(switched_b.json()["directory_generation"], 1)
+
+                for session_id, expected_dir, expected_image in (
+                    (session_a, computer_a_dir, "computer-a.jpg"),
+                    (session_b, computer_b_dir, "computer-b.jpg"),
+                ):
+                    use_session(session_id)
+                    config = client.get("/api/v1/config")
+                    self.assertEqual(config.json()["data_dir"], expected_dir.as_posix())
+                    self.assertEqual(config.json()["directory_generation"], 1)
+                    images = client.get(
+                        "/api/v1/images",
+                        params={"directory_generation": 1},
+                    )
+                    self.assertEqual(images.status_code, 200, images.text)
+                    self.assertEqual(
+                        [item["image_id"] for item in images.json()["items"]],
+                        [expected_image],
+                    )
+
     def test_switch_moves_io_and_same_directory_keeps_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

@@ -6,8 +6,11 @@ import asyncio
 import json
 import mimetypes
 import os
+import secrets
 import shutil
+import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -38,6 +41,49 @@ from .repository import (
 )
 from .statistics import build_attribute_statistics
 from .watcher import DirectoryChange, DirectorySyncService, FileStamp, ImageRecord
+
+
+CLIENT_SESSION_COOKIE = "annotation_session_id"
+CLIENT_SESSION_IDLE_SECONDS = 12 * 60 * 60
+CLIENT_SESSION_REAP_INTERVAL_SECONDS = 5 * 60
+
+
+@dataclass(slots=True)
+class ClientDirectorySession:
+    """Directory selection and watcher state owned by one browser session."""
+
+    session_id: str
+    repository: AnnotationRepository
+    directory_sync: DirectorySyncService = field(default_factory=DirectorySyncService)
+    directory_generation: int = 0
+    directory_switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    start_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    started: bool = False
+    active_streams: int = 0
+    last_seen: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.last_seen = time.monotonic()
+
+    async def ensure_started(self, *, wait_for_initial_scan: bool) -> None:
+        if self.started:
+            return
+        async with self.start_lock:
+            if self.started:
+                return
+            await self.directory_sync.start(
+                self.repository.data_dir,
+                self.directory_generation,
+                wait_for_initial_scan=wait_for_initial_scan,
+            )
+            self.started = True
+
+    async def stop(self) -> None:
+        async with self.start_lock:
+            if not self.started:
+                return
+            await self.directory_sync.stop()
+            self.started = False
 
 
 def _matches_stamp(metadata: os.stat_result, stamp: FileStamp, *, compare_ctime: bool = True) -> bool:
@@ -369,39 +415,156 @@ def create_app(
     allowed_data_roots: tuple[str | Path, ...] | None = None,
     wait_for_initial_scan: bool = True,
 ) -> FastAPI:
-    repository = AnnotationRepository(data_dir or DEFAULT_DATA_DIR)
+    initial_repository = AnnotationRepository(data_dir or DEFAULT_DATA_DIR)
     if allowed_data_roots is None:
         resolved_allowed_roots = _configured_allowed_data_roots()
     else:
         resolved_allowed_roots = _resolve_allowed_data_roots(
             list(allowed_data_roots)
         )
-    effective_allowed_roots = resolved_allowed_roots or (repository.data_dir,)
-    directory_sync = DirectorySyncService()
+    effective_allowed_roots = resolved_allowed_roots or (
+        initial_repository.data_dir,
+    )
+    health_directory_sync = DirectorySyncService()
+    client_sessions: dict[str, ClientDirectorySession] = {}
+    retired_client_sessions: dict[str, ClientDirectorySession] = {}
+    client_sessions_lock = asyncio.Lock()
+
+    async def resolve_client_session(
+        session_id: str | None,
+        *,
+        create: bool,
+        start: bool,
+    ) -> tuple[ClientDirectorySession | None, bool]:
+        created = False
+        async with client_sessions_lock:
+            client_session = (
+                client_sessions.get(session_id) if session_id else None
+            )
+            if client_session is None and create:
+                new_session_id = secrets.token_urlsafe(32)
+                while new_session_id in client_sessions:
+                    new_session_id = secrets.token_urlsafe(32)
+                client_session = ClientDirectorySession(
+                    session_id=new_session_id,
+                    repository=AnnotationRepository(
+                        initial_repository.data_dir
+                    ),
+                )
+                client_sessions[new_session_id] = client_session
+                created = True
+            if client_session is not None:
+                client_session.touch()
+
+        if client_session is not None and start:
+            await client_session.ensure_started(
+                wait_for_initial_scan=wait_for_initial_scan
+            )
+        return client_session, created
+
+    async def reap_idle_client_sessions() -> None:
+        while True:
+            await asyncio.sleep(CLIENT_SESSION_REAP_INTERVAL_SECONDS)
+            cutoff = time.monotonic() - CLIENT_SESSION_IDLE_SECONDS
+            async with client_sessions_lock:
+                expired = [
+                    (session_id, client_session)
+                    for session_id, client_session in client_sessions.items()
+                    if (
+                        client_session.active_streams == 0
+                        and client_session.last_seen < cutoff
+                    )
+                ]
+                for session_id, client_session in expired:
+                    if client_sessions.get(session_id) is client_session:
+                        client_sessions.pop(session_id, None)
+                        retired_client_sessions[session_id] = client_session
+            if not expired:
+                continue
+            await asyncio.gather(
+                *(session.stop() for _, session in expired),
+                return_exceptions=True,
+            )
+            async with client_sessions_lock:
+                for session_id, client_session in expired:
+                    if (
+                        retired_client_sessions.get(session_id)
+                        is client_session
+                    ):
+                        retired_client_sessions.pop(session_id, None)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        await directory_sync.start(
-            repository.data_dir,
-            application.state.directory_generation,
+        await health_directory_sync.start(
+            initial_repository.data_dir,
+            0,
             wait_for_initial_scan=wait_for_initial_scan,
+        )
+        session_reaper = asyncio.create_task(
+            reap_idle_client_sessions(),
+            name="annotation-client-session-reaper",
         )
         try:
             yield
         finally:
-            await directory_sync.stop()
+            session_reaper.cancel()
+            await asyncio.gather(session_reaper, return_exceptions=True)
+            async with client_sessions_lock:
+                sessions = (
+                    *client_sessions.values(),
+                    *retired_client_sessions.values(),
+                )
+                client_sessions.clear()
+                retired_client_sessions.clear()
+            if sessions:
+                await asyncio.gather(
+                    *(session.stop() for session in sessions),
+                    return_exceptions=True,
+                )
+            await health_directory_sync.stop()
 
     app = FastAPI(
         title="多属性图像标注工具",
         version="1.0.0",
         lifespan=lifespan,
     )
-    app.state.repository = repository
-    app.state.image_locks = {}
-    app.state.directory_switch_lock = asyncio.Lock()
+    # These initial-directory attributes remain useful to health checks and
+    # operational tooling. Interactive requests use client_sessions instead.
+    app.state.repository = initial_repository
     app.state.directory_generation = 0
     app.state.allowed_data_roots = effective_allowed_roots
-    app.state.directory_sync = directory_sync
+    app.state.directory_sync = health_directory_sync
+    app.state.client_sessions = client_sessions
+    app.state.data_mutation_lock = asyncio.Lock()
+
+    @app.middleware("http")
+    async def bind_client_directory_session(
+        request: Request,
+        call_next: Any,
+    ) -> Response:
+        path = request.url.path
+        is_health_check = path == "/api/v1/health"
+        is_data_api = path.startswith("/api/v1/") and not is_health_check
+        should_create = path == "/" or is_data_api
+        client_session, created = await resolve_client_session(
+            request.cookies.get(CLIENT_SESSION_COOKIE),
+            create=should_create,
+            start=is_data_api or is_health_check,
+        )
+        if client_session is not None:
+            request.state.client_directory_session = client_session
+
+        response = await call_next(request)
+        if created and client_session is not None:
+            response.set_cookie(
+                CLIENT_SESSION_COOKIE,
+                client_session.session_id,
+                httponly=True,
+                samesite="lax",
+                secure=request.url.scheme == "https",
+                path="/",
+            )
+        return response
 
     @app.middleware("http")
     async def disable_ui_asset_cache(
@@ -420,18 +583,15 @@ def create_app(
             response.headers["Expires"] = "0"
         return response
 
-    def image_lock(image_id: str) -> asyncio.Lock:
-        lock = app.state.image_locks.get(image_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            app.state.image_locks[image_id] = lock
-        return lock
+    def client_session_for_request(request: Request) -> ClientDirectorySession:
+        return request.state.client_directory_session
 
     def repository_for_generation(
+        client_session: ClientDirectorySession,
         requested_generation: int | None,
     ) -> tuple[AnnotationRepository, int]:
-        current_generation = app.state.directory_generation
-        current_repository = repository
+        current_generation = client_session.directory_generation
+        current_repository = client_session.repository
         if requested_generation != current_generation:
             raise HTTPException(
                 status_code=409,
@@ -448,9 +608,10 @@ def create_app(
         return current_repository, current_generation
 
     @app.get("/api/v1/config")
-    async def get_config() -> dict[str, Any]:
-        current_repository = repository
-        current_generation = app.state.directory_generation
+    async def get_config(http_request: Request) -> dict[str, Any]:
+        client_session = client_session_for_request(http_request)
+        current_repository = client_session.repository
+        current_generation = client_session.directory_generation
         return {
             "annotation_version": ANNOTATION_VERSION,
             "data_dir": current_repository.data_dir.as_posix(),
@@ -463,6 +624,7 @@ def create_app(
 
     @app.get("/api/v1/data-directories")
     async def browse_data_directories(
+        http_request: Request,
         path: str | None = Query(default=None, max_length=4096),
         directory_generation: int = Query(ge=0),
         x_requested_with: str | None = Header(default=None),
@@ -477,7 +639,9 @@ def create_app(
                 },
             )
 
+        client_session = client_session_for_request(http_request)
         current_repository, current_generation = repository_for_generation(
+            client_session,
             directory_generation
         )
         browse_roots = effective_allowed_roots
@@ -529,10 +693,11 @@ def create_app(
 
     @app.post("/api/v1/data-directory/select")
     async def select_data_directory(
+        http_request: Request,
         request: SelectDataDirectoryRequest | None = None,
         x_requested_with: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        nonlocal repository
+        client_session = client_session_for_request(http_request)
         if x_requested_with != "annotation-ui":
             raise HTTPException(
                 status_code=403,
@@ -552,7 +717,7 @@ def create_app(
                     ),
                 },
             )
-        if app.state.directory_switch_lock.locked():
+        if client_session.directory_switch_lock.locked():
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -560,9 +725,9 @@ def create_app(
                     "message": "另一个数据目录切换正在进行，请稍后重试。",
                 },
             )
-        async with app.state.directory_switch_lock:
-            current_repository = repository
-            current_generation = app.state.directory_generation
+        async with client_session.directory_switch_lock:
+            current_repository = client_session.repository
+            current_generation = client_session.directory_generation
             if request.directory_generation != current_generation:
                 raise HTTPException(
                     status_code=409,
@@ -620,32 +785,35 @@ def create_app(
 
             changed = candidate.data_dir != current_repository.data_dir
             if changed:
-                repository = candidate
-                app.state.repository = candidate
-                app.state.image_locks = {}
-                app.state.directory_generation += 1
-                await directory_sync.switch_directory(
+                new_generation = current_generation + 1
+                await client_session.directory_sync.switch_directory(
                     candidate.data_dir,
-                    app.state.directory_generation,
+                    new_generation,
                 )
+                client_session.repository = candidate
+                client_session.directory_generation = new_generation
             return {
                 "status": "selected",
                 "changed": changed,
                 "data_dir": candidate.data_dir.as_posix(),
-                "directory_generation": app.state.directory_generation,
+                "directory_generation": client_session.directory_generation,
             }
 
     @app.get("/api/v1/images")
     async def get_images(
+        http_request: Request,
         status: Literal["all", "labeled", "unlabeled", "invalid"] = "all",
         search: str = "",
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100000, ge=1, le=100000),
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
+        client_session = client_session_for_request(http_request)
         current_repository, current_generation = repository_for_generation(
+            client_session,
             directory_generation
         )
+        directory_sync = client_session.directory_sync
         snapshot = directory_sync.ready_snapshot(current_generation)
 
         def collect_images() -> list[dict[str, Any]]:
@@ -706,8 +874,12 @@ def create_app(
     ) -> StreamingResponse:
         """Stream settled image-directory changes for the selected directory."""
 
-        _, current_generation = repository_for_generation(directory_generation)
-        subscriber_id, event_queue = directory_sync.subscribe(current_generation)
+        client_session = client_session_for_request(request)
+        _, current_generation = repository_for_generation(
+            client_session,
+            directory_generation,
+        )
+        directory_sync = client_session.directory_sync
 
         def encode_event(
             event_name: str,
@@ -725,6 +897,11 @@ def create_app(
             return "\n".join(lines) + "\n\n"
 
         async def stream_events() -> AsyncIterator[str]:
+            client_session.active_streams += 1
+            client_session.touch()
+            subscriber_id, event_queue = directory_sync.subscribe(
+                current_generation
+            )
             try:
                 yield "retry: 2000\n" + encode_event(
                     "ready",
@@ -769,6 +946,8 @@ def create_app(
                         break
             finally:
                 directory_sync.unsubscribe(subscriber_id)
+                client_session.active_streams -= 1
+                client_session.touch()
 
         return StreamingResponse(
             stream_events(),
@@ -782,11 +961,15 @@ def create_app(
 
     @app.get("/api/v1/statistics")
     async def get_statistics(
+        http_request: Request,
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
+        client_session = client_session_for_request(http_request)
         current_repository, current_generation = repository_for_generation(
+            client_session,
             directory_generation
         )
+        directory_sync = client_session.directory_sync
         snapshot = directory_sync.ready_snapshot(current_generation)
 
         def collect_statistics() -> dict[str, Any]:
@@ -808,9 +991,15 @@ def create_app(
 
     @app.get("/api/v1/export")
     async def export_annotations(
+        http_request: Request,
         directory_generation: int = Query(ge=0),
     ) -> FileResponse:
-        current_repository, current_generation = repository_for_generation(directory_generation)
+        client_session = client_session_for_request(http_request)
+        current_repository, current_generation = repository_for_generation(
+            client_session,
+            directory_generation,
+        )
+        directory_sync = client_session.directory_sync
         try:
             archive = await asyncio.to_thread(
                 create_export_archive,
@@ -833,38 +1022,61 @@ def create_app(
 
     @app.delete("/api/v1/image")
     async def delete_image(
+        http_request: Request,
         image_id: str = Query(min_length=1),
         directory_generation: int = Query(ge=0),
     ) -> dict[str, Any]:
+        client_session = client_session_for_request(http_request)
         # 在锁内重新校验 generation，等待期间切换目录的请求不能继续删除。
-        async with app.state.directory_switch_lock:
-            current_repository, current_generation = repository_for_generation(directory_generation)
-            try:
-                result = await asyncio.to_thread(current_repository.delete_image, image_id)
-            except DeleteImageError as exc:
-                status_code = {"shared_annotation": 409, "image_not_found": 404}.get(exc.code, 500)
-                raise HTTPException(
-                    status_code=status_code,
-                    detail={
-                        "code": exc.code, "message": str(exc), **exc.state,
-                        "directory_generation": current_generation,
-                    },
-                ) from exc
-            except RepositoryError as exc:
-                _raise_repository_http(exc)
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail={"code": "delete_failed", "message": f"删除失败：{exc}"},
-                ) from exc
+        async with client_session.directory_switch_lock:
+            current_repository, current_generation = repository_for_generation(
+                client_session,
+                directory_generation,
+            )
+            async with app.state.data_mutation_lock:
+                try:
+                    result = await asyncio.to_thread(
+                        current_repository.delete_image,
+                        image_id,
+                    )
+                except DeleteImageError as exc:
+                    status_code = {
+                        "shared_annotation": 409,
+                        "image_not_found": 404,
+                    }.get(exc.code, 500)
+                    raise HTTPException(
+                        status_code=status_code,
+                        detail={
+                            "code": exc.code,
+                            "message": str(exc),
+                            **exc.state,
+                            "directory_generation": current_generation,
+                        },
+                    ) from exc
+                except RepositoryError as exc:
+                    _raise_repository_http(exc)
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "code": "delete_failed",
+                            "message": f"删除失败：{exc}",
+                        },
+                    ) from exc
             return {**result, "directory_generation": current_generation}
 
     @app.get("/api/v1/image")
     async def get_image(
+        http_request: Request,
         image_id: str = Query(min_length=1),
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> StreamingResponse:
-        current_repository, current_generation = repository_for_generation(directory_generation)
+        client_session = client_session_for_request(http_request)
+        current_repository, current_generation = repository_for_generation(
+            client_session,
+            directory_generation,
+        )
+        directory_sync = client_session.directory_sync
         try:
             image_path = current_repository.resolve_image(image_id)
             canonical_id = current_repository.image_id_for_path(image_path)
@@ -885,7 +1097,7 @@ def create_app(
                 headers={"Cache-Control": "no-store"},
             ) from exc
         try:
-            repository_for_generation(current_generation)
+            repository_for_generation(client_session, current_generation)
         except HTTPException:
             snapshot.close()
             raise
@@ -895,10 +1107,13 @@ def create_app(
 
     @app.get("/api/v1/annotation")
     async def get_annotation(
+        http_request: Request,
         image_id: str = Query(min_length=1),
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
+        client_session = client_session_for_request(http_request)
         current_repository, current_generation = repository_for_generation(
+            client_session,
             directory_generation
         )
         try:
@@ -932,12 +1147,15 @@ def create_app(
 
     @app.put("/api/v1/annotation")
     async def put_annotation(
+        http_request: Request,
         request: SaveAnnotationRequest,
         image_id: str = Query(min_length=1),
         directory_generation: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
-        async with app.state.directory_switch_lock:
+        client_session = client_session_for_request(http_request)
+        async with client_session.directory_switch_lock:
             current_repository, current_generation = repository_for_generation(
+                client_session,
                 directory_generation
             )
             try:
@@ -946,7 +1164,7 @@ def create_app(
             except RepositoryError as exc:
                 _raise_repository_http(exc)
 
-            async with image_lock(str(current_repository.sidecar_path(image_path))):
+            async with app.state.data_mutation_lock:
                 try:
                     document, revision = await asyncio.to_thread(
                         current_repository.save_annotation,
@@ -965,9 +1183,23 @@ def create_app(
         }
 
     @app.get("/api/v1/health")
-    async def get_health(response: Response) -> dict[str, Any]:
-        current_repository = repository
-        current_generation = app.state.directory_generation
+    async def get_health(
+        http_request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        client_session = getattr(
+            http_request.state,
+            "client_directory_session",
+            None,
+        )
+        if client_session is None:
+            current_repository = initial_repository
+            current_generation = 0
+            directory_sync = health_directory_sync
+        else:
+            current_repository = client_session.repository
+            current_generation = client_session.directory_generation
+            directory_sync = client_session.directory_sync
         exists = current_repository.data_dir.is_dir()
         readable = os.access(current_repository.data_dir, os.R_OK)
         writable = os.access(current_repository.data_dir, os.W_OK)

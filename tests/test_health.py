@@ -15,11 +15,56 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from annotation_app.main import create_app
+from annotation_app.main import CLIENT_SESSION_COOKIE, create_app
 from annotation_app.watcher import DirectorySyncService
 
 
 class HealthApiTests(unittest.TestCase):
+    def test_health_uses_existing_session_without_creating_probe_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            initial_dir = root / "initial"
+            selected_dir = root / "0904"
+            initial_dir.mkdir()
+            selected_dir.mkdir()
+            app = create_app(initial_dir, allowed_data_roots=(root,))
+
+            with TestClient(app) as client:
+                anonymous_health = client.get("/api/v1/health")
+                self.assertNotIn("set-cookie", anonymous_health.headers)
+                self.assertEqual(len(app.state.client_sessions), 0)
+
+                config = client.get("/api/v1/config")
+                self.assertIsNotNone(
+                    config.cookies.get(CLIENT_SESSION_COOKIE)
+                )
+                selected = client.post(
+                    "/api/v1/data-directory/select",
+                    headers={"X-Requested-With": "annotation-ui"},
+                    json={
+                        "path": str(selected_dir),
+                        "directory_generation": 0,
+                    },
+                )
+                self.assertEqual(selected.status_code, 200, selected.text)
+
+                session_health = client.get("/api/v1/health")
+                self.assertEqual(
+                    session_health.json()["data_dir"],
+                    selected_dir.as_posix(),
+                )
+                self.assertEqual(
+                    session_health.json()["directory_generation"],
+                    1,
+                )
+
+                client.cookies.clear()
+                probe_health = client.get("/api/v1/health")
+                self.assertNotIn("set-cookie", probe_health.headers)
+                self.assertEqual(probe_health.json()["data_dir"], initial_dir.as_posix())
+                self.assertEqual(probe_health.json()["directory_generation"], 0)
+                self.assertEqual(len(app.state.client_sessions), 1)
+
     def test_health_is_available_while_initial_scan_is_running(self) -> None:
         scan_started = threading.Event()
         release_scan = threading.Event()
