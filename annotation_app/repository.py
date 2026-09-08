@@ -224,9 +224,11 @@ class AnnotationRepository:
             annotation_valid: bool | None = None
             annotation_error: str | None = None
             revision: str | None = None
+            annotations: dict[str, Any] | None = None
             if annotation_exists:
                 try:
-                    _, revision = self._read_document(resolved)
+                    document, revision = self._read_document(resolved)
+                    annotations = document.annotations.model_dump(mode="json")
                     annotation_valid = True
                 except InvalidAnnotationFileError as exc:
                     annotation_valid = False
@@ -235,6 +237,9 @@ class AnnotationRepository:
                         revision = file_revision(sidecar)
                     except OSError:
                         revision = None
+            else:
+                # 未标注图像按表单默认值参与筛选；损坏的标注保留为 None。
+                annotations = AnnotationValues().model_dump(mode="json")
 
             try:
                 stat = resolved.stat()
@@ -251,6 +256,7 @@ class AnnotationRepository:
                     "annotation_exists": annotation_exists,
                     "annotation_valid": annotation_valid,
                     "annotation_error": annotation_error,
+                    "annotations": annotations,
                     "revision": revision,
                     "size": stat.st_size,
                     "modified_at": datetime.fromtimestamp(

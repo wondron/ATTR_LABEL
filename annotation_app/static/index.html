@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>食物图像多属性标注台</title>
-  <link rel="stylesheet" href="/static/styles.css?v=linux-realtime-stats-2">
+  <link rel="stylesheet" href="/static/styles.css?v=annotation-filter-1">
   <link rel="stylesheet" href="/static/directory-browser.css?v=linux-realtime-stats-2">
 </head>
 <body>
@@ -67,6 +67,14 @@
               <option value="invalid">仅异常</option>
             </select>
           </label>
+        </div>
+
+        <div class="annotation-filter-tools">
+          <button type="button" class="button button--secondary" id="openFilterButton" aria-haspopup="dialog" aria-controls="annotationFilterDialog" disabled>数据筛查</button>
+          <div class="annotation-filter-summary" id="annotationFilterSummaryRow" hidden>
+            <span id="annotationFilterSummary" role="status" aria-live="polite"></span>
+            <button type="button" class="button button--subtle button--compact" id="clearAnnotationFilterButton">清除</button>
+          </div>
         </div>
 
         <button type="button" class="button button--secondary download-button" id="downloadAnnotatedButton" aria-busy="false" title="下载当前文件夹已保存的有效标注及原图" disabled>下载已标注数据</button>
@@ -249,6 +257,32 @@
     </main>
   </div>
 
+  <dialog class="annotation-filter-dialog" id="annotationFilterDialog" aria-labelledby="annotationFilterTitle" aria-describedby="annotationFilterDescription">
+    <form class="annotation-filter-modal" id="annotationFilterForm" novalidate>
+      <header class="statistics-modal-header">
+        <div class="statistics-modal-heading">
+          <span class="eyebrow">按标注值查看图像</span>
+          <h2 id="annotationFilterTitle">数据筛查</h2>
+          <p id="annotationFilterDescription">不同属性需同时满足；多选属性命中任一所选值即可。未标注图像及缺失属性按默认值匹配。</p>
+        </div>
+        <button type="button" class="dialog-close-button" id="closeAnnotationFilterButton" aria-label="关闭数据筛查" title="关闭（Esc）">×</button>
+      </header>
+      <div class="annotation-filter-body">
+        <p class="annotation-filter-help">按已保存的标注筛选，可与文件名、标注状态筛选同时使用。异常 JSON 不参与属性匹配。</p>
+        <div class="annotation-filter-fields" id="annotationFilterFields"></div>
+      </div>
+      <footer class="annotation-filter-footer">
+        <p class="field-error" id="annotationFilterError" role="alert"></p>
+        <div class="annotation-filter-actions">
+          <button type="button" class="button button--subtle" id="resetAnnotationFilterButton">重置条件</button>
+          <span class="annotation-filter-action-spacer"></span>
+          <button type="button" class="button button--secondary" id="cancelAnnotationFilterButton">取消</button>
+          <button type="submit" class="button button--primary" id="applyAnnotationFilterButton">应用筛选</button>
+        </div>
+      </footer>
+    </form>
+  </dialog>
+
   <dialog class="statistics-dialog" id="statisticsDialog" aria-labelledby="statisticsDialogTitle" aria-describedby="statisticsDialogDescription">
     <div class="statistics-modal">
       <header class="statistics-modal-header">
@@ -364,6 +398,6 @@
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="/static/app.js?v=linux-realtime-stats-2" defer></script>
+  <script src="/static/app.js?v=annotation-filter-1" defer></script>
 </body>
 </html>

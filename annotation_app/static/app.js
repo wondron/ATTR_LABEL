@@ -26,6 +26,7 @@
     options: cloneOptions(DEFAULT_OPTIONS),
     images: [],
     filteredImages: [],
+    annotationFilters: {},
     counts: { total: 0, labeled: 0, unlabeled: 0, invalid: 0 },
     currentImage: null,
     annotationExists: false,
@@ -105,6 +106,18 @@
     visibleCount: byId("visibleCount"),
     search: byId("imageSearch"),
     filter: byId("statusFilter"),
+    openFilterButton: byId("openFilterButton"),
+    annotationFilterDialog: byId("annotationFilterDialog"),
+    annotationFilterForm: byId("annotationFilterForm"),
+    annotationFilterFields: byId("annotationFilterFields"),
+    annotationFilterError: byId("annotationFilterError"),
+    applyAnnotationFilterButton: byId("applyAnnotationFilterButton"),
+    resetAnnotationFilterButton: byId("resetAnnotationFilterButton"),
+    cancelAnnotationFilterButton: byId("cancelAnnotationFilterButton"),
+    closeAnnotationFilterButton: byId("closeAnnotationFilterButton"),
+    clearAnnotationFilterButton: byId("clearAnnotationFilterButton"),
+    annotationFilterSummary: byId("annotationFilterSummary"),
+    annotationFilterSummaryRow: byId("annotationFilterSummaryRow"),
     imageList: byId("imageList"),
     listPlaceholder: byId("listPlaceholder"),
     currentFileName: byId("currentFileName"),
@@ -476,17 +489,21 @@
       return item;
     });
 
-    // 拍摄端若正在替换文件，短暂的删除事件不能把标注人员当前图片抢走。
-    // 当前项会在用户切换到别的图片后的下一次同步中自然移除。
+    // 无筛选时保留当前预览以容忍拍摄端替换文件；筛查时移除已消失的结果。
+    // 尚未保存的表单仍受保护；清空已消失的项会使其在途读取失效。
     if (state.currentImage && !selectedItem) {
-      const previousIndex = previousItems.findIndex(
-        (item) => imageKey(item.id) === selectedId
-      );
-      const insertionIndex = previousIndex < 0
-        ? merged.length
-        : Math.min(previousIndex, merged.length);
-      merged.splice(insertionIndex, 0, state.currentImage);
-      selectedItem = state.currentImage;
+      if (Object.keys(state.annotationFilters).length && !state.dirty) {
+        clearCurrentImage();
+      } else {
+        const previousIndex = previousItems.findIndex(
+          (item) => imageKey(item.id) === selectedId
+        );
+        const insertionIndex = previousIndex < 0
+          ? merged.length
+          : Math.min(previousIndex, merged.length);
+        merged.splice(insertionIndex, 0, state.currentImage);
+        selectedItem = state.currentImage;
+      }
     }
 
     state.images = merged;
@@ -626,6 +643,7 @@
       if (canAutoSelect && state.filteredImages.length) {
         await selectImage(state.filteredImages[0].id, { skipPrompt: true });
       }
+      if (Object.keys(state.annotationFilters).length) await reconcileFilteredSelection();
       return true;
     } catch (error) {
       if (requestedGeneration !== state.directoryGeneration) return false;
@@ -871,6 +889,7 @@
         item.annotation_exists = outcome.annotation_exists;
         if (!outcome.annotation_exists) {
           item.annotation_valid = null;
+          item.annotations = null;
           item.revision = "__missing__";
         }
       }
@@ -1215,6 +1234,9 @@
 
     elements.search.value = "";
     elements.filter.value = "all";
+    state.annotationFilters = {};
+    closeAnnotationFilter();
+    updateAnnotationFilterSummary();
     elements.rootPath.textContent = dataDir;
     elements.rootPath.title = dataDir;
     elements.currentFileName.textContent = "尚未选择图像";
@@ -1721,19 +1743,247 @@
     elements.listPlaceholder.classList.remove("hidden");
   }
 
-  function applyListFilters() {
+  function annotationFilterDefinitions() {
+    const defaults = createEmptyAnnotations(state.config);
+    const labels = {
+      food_name: "食物名称", food_count: "食物数量", quality: "总重量（g）",
+      device_model: "设备型号", container_type: "容器类型", accessory_type: "附件类型",
+      rack_level: "层位", food_size: "食物尺寸"
+    };
+    return Object.entries(labels).map(([name, label]) => ({
+      name, label, default: defaults[name],
+      multiple: Array.isArray(defaults[name]),
+      numeric: ["food_count", "quality", "food_size"].includes(name),
+      options: state.options[name] || []
+    }));
+  }
+
+  function filterDefaultLabel(value) {
+    if (value == null || value === "") return "未指定";
+    return Array.isArray(value) ? value.join("、") : String(value);
+  }
+
+  function renderAnnotationFilterFields(filters) {
+    elements.annotationFilterFields.replaceChildren();
+    elements.annotationFilterError.textContent = "";
+    for (const field of annotationFilterDefinitions()) {
+      const condition = filters[field.name];
+      const card = document.createElement("div");
+      card.className = "annotation-filter-field";
+      const label = document.createElement("label");
+      label.textContent = field.label;
+      label.setAttribute("for", `annotationFilterMode_${field.name}`);
+      const mode = document.createElement("select");
+      mode.id = `annotationFilterMode_${field.name}`;
+      const modes = [
+        ["all", "不限"],
+        ["default", `默认值（${filterDefaultLabel(field.default)}）`],
+        ["value", field.multiple ? "包含任一所选值" : "等于指定值"]
+      ];
+      if (field.name === "food_name") modes.push(["contains", "包含关键词"]);
+      for (const [value, text] of modes) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        mode.append(option);
+      }
+      mode.value = condition ? condition.mode : "all";
+      const values = document.createElement("div");
+      values.className = "annotation-filter-values";
+      if (field.multiple) {
+        values.id = `annotationFilterChoices_${field.name}`;
+        values.setAttribute("role", "group");
+        values.setAttribute("aria-label", `${field.label}筛选值`);
+        const selected = condition && condition.values || [];
+        for (const value of field.options) {
+          const choice = document.createElement("label");
+          choice.className = "annotation-filter-choice";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.value = value;
+          checkbox.checked = selected.includes(value);
+          const text = document.createElement("span");
+          text.textContent = value;
+          choice.append(checkbox, text);
+          values.append(choice);
+        }
+      } else {
+        const input = document.createElement(field.options.length ? "select" : "input");
+        input.id = `annotationFilterValue_${field.name}`;
+        input.setAttribute("aria-label", `${field.label}筛选值`);
+        if (field.options.length) {
+          for (const value of field.options) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = value;
+            input.append(option);
+          }
+        } else {
+          input.type = field.numeric ? "number" : "text";
+          input.step = field.name === "quality" ? "any" : "1";
+          if (field.name === "food_count") input.min = "0";
+          if (field.name === "food_size") input.min = "1";
+          input.placeholder = field.numeric ? "输入数值" : "输入食物名称";
+        }
+        input.value = condition && condition.value != null ? String(condition.value) : (field.options[0] || "");
+        values.append(input);
+      }
+      const updateMode = () => {
+        values.hidden = !["value", "contains"].includes(mode.value);
+        for (const input of values.querySelectorAll("input, select")) input.disabled = values.hidden;
+        elements.annotationFilterError.textContent = "";
+      };
+      mode.addEventListener("change", updateMode);
+      updateMode();
+      card.append(label, mode, values);
+      elements.annotationFilterFields.append(card);
+    }
+  }
+
+  function annotationFilterBusy() {
+    return state.saving || state.deleting || state.loadingAnnotation || state.switchingFolder
+      || state.directoryStale || state.imageStateUncertain || state.directoryGeneration == null;
+  }
+
+  function openAnnotationFilter() {
+    if (annotationFilterBusy()) return;
+    renderAnnotationFilterFields(state.annotationFilters);
+    elements.annotationFilterDialog.showModal();
+    document.body.classList.add("dialog-open");
+    elements.annotationFilterFields.querySelector("select").focus();
+  }
+
+  function closeAnnotationFilter() {
+    if (elements.annotationFilterDialog.open) elements.annotationFilterDialog.close();
+  }
+
+  function readAnnotationFilters() {
+    const filters = {};
+    for (const field of annotationFilterDefinitions()) {
+      const mode = byId(`annotationFilterMode_${field.name}`).value;
+      if (mode === "all") continue;
+      if (mode === "default") {
+        filters[field.name] = { mode };
+      } else if (field.multiple) {
+        const values = Array.from(byId(`annotationFilterChoices_${field.name}`)
+          .querySelectorAll("input:checked")).map((input) => input.value);
+        if (!values.length) throw new Error(`请至少选择一个${field.label}筛选值。`);
+        filters[field.name] = { mode, values };
+      } else {
+        const input = byId(`annotationFilterValue_${field.name}`);
+        const value = input.value.trim();
+        if (!value) {
+          input.focus();
+          throw new Error(`请填写${field.label}筛选值；筛选未指定值请选“默认值”。`);
+        }
+        if (field.numeric) {
+          const number = Number(value);
+          const invalid = !Number.isFinite(number)
+            || (field.name !== "quality" && !Number.isInteger(number))
+            || (field.name === "food_count" && number < 0)
+            || (field.name === "food_size" && number <= 0);
+          if (invalid) {
+            input.focus();
+            throw new Error(`请填写有效的${field.label}${field.name === "quality" ? "数值" : "整数"}。`);
+          }
+          filters[field.name] = { mode, value: number };
+        } else {
+          filters[field.name] = { mode, value };
+        }
+      }
+    }
+    return filters;
+  }
+
+  function matchesAnnotationFilters(item, filters, defaults) {
+    if (!Object.keys(filters).length) return true;
+    if (item.annotation_valid === false) return false;
+    // 使用列表中的已保存值；表单草稿不影响筛选，缺失属性复用表单默认值。
+    const annotations = { ...defaults, ...(item.annotations || {}) };
+    return Object.entries(filters).every(([name, condition]) => {
+      const value = annotations[name];
+      if (condition.mode === "default") {
+        const fallback = defaults[name];
+        if (Array.isArray(fallback)) {
+          return Array.isArray(value) && value.length === fallback.length
+            && fallback.every((entry) => value.includes(entry));
+        }
+        if (fallback == null || fallback === "") return value == null || value === "";
+        return String(value) === String(fallback);
+      }
+      if (condition.values) return Array.isArray(value) && condition.values.some((entry) => value.includes(entry));
+      if (condition.mode === "contains") return String(value).toLocaleLowerCase("zh-CN")
+        .includes(condition.value.toLocaleLowerCase("zh-CN"));
+      if (typeof condition.value === "number") return value != null && value !== "" && Number(value) === condition.value;
+      return value === condition.value;
+    });
+  }
+
+  function listFilteredImages(filters) {
     const query = elements.search.value.trim().toLocaleLowerCase("zh-CN");
     const filter = elements.filter.value;
-    state.filteredImages = state.images.filter((item) => {
+    const defaults = createEmptyAnnotations(state.config);
+    return state.images.filter((item) => {
       const name = String(item.name || item.id || "").toLocaleLowerCase("zh-CN");
       if (query && !name.includes(query)) return false;
+      if (!matchesAnnotationFilters(item, filters, defaults)) return false;
       const status = imageStatus(item);
       if (filter === "all") return true;
       if (filter === "unlabeled") return status === "unlabeled" || status === "draft";
       if (filter === "labeled") return Boolean(item.annotated);
       return status === filter;
     });
+  }
+
+  function updateAnnotationFilterSummary() {
+    const count = Object.keys(state.annotationFilters).length;
+    elements.openFilterButton.textContent = count ? `数据筛查（${count}）` : "数据筛查";
+    elements.annotationFilterSummaryRow.hidden = !count;
+    elements.annotationFilterSummary.textContent = count ? `${count} 项条件 · 匹配 ${state.filteredImages.length} 张` : "";
+    elements.annotationFilterSummary.title = annotationFilterDefinitions()
+      .filter((field) => state.annotationFilters[field.name])
+      .map((field) => {
+        const condition = state.annotationFilters[field.name];
+        return `${field.label}：${condition.mode === "default" ? filterDefaultLabel(field.default)
+          : condition.values ? condition.values.join(" / ") : condition.value}`;
+      }).join("；");
+  }
+
+  async function reconcileFilteredSelection(preferredIndex = 0) {
+    if (state.dirty || state.saving || state.deleting || state.loadingAnnotation
+      || state.switchingFolder || state.directoryStale) return;
+    if (state.currentImage && currentFilteredIndex() >= 0) return;
+    const target = state.filteredImages[Math.max(0, Math.min(preferredIndex, state.filteredImages.length - 1))];
+    if (target) await selectImage(target.id, { skipPrompt: true });
+    else clearCurrentImage();
+    updateControls();
+  }
+
+  async function commitAnnotationFilters(filters) {
+    if (annotationFilterBusy()) return;
+    const matching = listFilteredImages(filters);
+    const leaving = state.currentImage && !matching.some((item) => imageKey(item.id) === currentImageKey());
+    if (leaving && !canDiscardCurrentChanges()) return;
+    if (leaving) clearCurrentImage();
+    state.annotationFilters = filters;
+    applyListFilters();
+    closeAnnotationFilter();
+    await reconcileFilteredSelection();
+  }
+
+  async function applyAnnotationFilters(event) {
+    event.preventDefault();
+    try {
+      await commitAnnotationFilters(readAnnotationFilters());
+    } catch (error) {
+      elements.annotationFilterError.textContent = error.message;
+    }
+  }
+
+  function applyListFilters() {
+    state.filteredImages = listFilteredImages(state.annotationFilters);
     elements.visibleCount.textContent = `${state.filteredImages.length} 张`;
+    updateAnnotationFilterSummary();
     renderImageList();
     updateNavigation();
   }
@@ -1750,7 +2000,7 @@
       const title = document.createElement("strong");
       title.textContent = state.images.length ? "没有匹配的图像" : "目录中没有图像";
       const text = document.createElement("p");
-      text.textContent = state.images.length ? "请更换关键词或标注状态筛选。" : "当前文件夹中没有支持的图像。";
+      text.textContent = state.images.length ? "请调整文件名、标注状态或数据筛查条件。" : "当前文件夹中没有支持的图像。";
       empty.append(title, text);
       fragment.append(empty);
     } else {
@@ -1907,6 +2157,8 @@
       if (sequence !== state.loadSequence) return;
       state.loadingAnnotation = false;
       updateControls();
+      // 加载过程中可能收到新列表或更改搜索条件，此时补做延后的预览切换。
+      if (Object.keys(state.annotationFilters).length) await reconcileFilteredSelection();
     }
 
   }
@@ -2269,9 +2521,11 @@
       state.annotationExists = true;
       state.annotationInvalid = false;
       state.currentImage.annotated = true;
+      state.currentImage.annotation_exists = true;
       state.currentImage.annotation_valid = true;
       const editedWhileSaving = state.editRevision !== editRevisionAtStart;
       const savedDocument = result && (result.document || result.annotation);
+      state.currentImage.annotations = savedDocument && savedDocument.annotations ? savedDocument.annotations : annotations;
       if (editedWhileSaving) {
         state.dirty = true;
         state.draftImageIds.add(currentImageKey());
@@ -2303,7 +2557,13 @@
       if (moveNext && nextImageId != null && !editedWhileSaving) {
         state.saving = false;
         updateControls();
-        await selectImage(nextImageId, { skipPrompt: true });
+        if (state.filteredImages.some((item) => imageKey(item.id) === imageKey(nextImageId))) {
+          await selectImage(nextImageId, { skipPrompt: true });
+        }
+      }
+      if (Object.keys(state.annotationFilters).length && !editedWhileSaving) {
+        state.saving = false;
+        await reconcileFilteredSelection(beforeSaveIndex);
       }
       return true;
     } catch (error) {
@@ -2351,6 +2611,9 @@
     const index = currentFilteredIndex();
     const total = state.filteredImages.length;
     elements.positionText.textContent = index >= 0 ? `${index + 1} / ${total}` : `0 / ${total}`;
+    if (state.currentImage && index < 0 && Object.keys(state.annotationFilters).length) {
+      elements.positionText.textContent = `筛选外 / ${total}`;
+    }
     const busy = state.loadingAnnotation || state.saving || state.deleting || state.switchingFolder || state.directoryStale;
     elements.previousButton.disabled = busy || index <= 0;
     elements.nextButton.disabled = busy || index < 0 || index >= total - 1;
@@ -2390,6 +2653,10 @@
     elements.chooseDataDirButton.disabled = state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving || state.deleting || state.downloading;
     elements.search.disabled = state.deleting || state.switchingFolder || state.directoryStale;
     elements.filter.disabled = state.deleting || state.switchingFolder || state.directoryStale;
+    const filterBusy = annotationFilterBusy();
+    elements.openFilterButton.disabled = filterBusy;
+    elements.applyAnnotationFilterButton.disabled = filterBusy;
+    elements.clearAnnotationFilterButton.disabled = filterBusy;
     for (const item of elements.imageList.querySelectorAll(".image-item")) {
       item.disabled = state.saving || state.deleting || state.switchingFolder || state.directoryStale;
     }
@@ -2426,6 +2693,26 @@
   }
 
   function bindEvents() {
+    elements.openFilterButton.addEventListener("click", openAnnotationFilter);
+    elements.annotationFilterForm.addEventListener("submit", applyAnnotationFilters);
+    elements.resetAnnotationFilterButton.addEventListener("click", () => renderAnnotationFilterFields({}));
+    elements.clearAnnotationFilterButton.addEventListener("click", () => commitAnnotationFilters({}));
+    elements.cancelAnnotationFilterButton.addEventListener("click", closeAnnotationFilter);
+    elements.closeAnnotationFilterButton.addEventListener("click", closeAnnotationFilter);
+    elements.annotationFilterDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeAnnotationFilter();
+    });
+    elements.annotationFilterDialog.addEventListener("click", (event) => {
+      if (event.target !== elements.annotationFilterDialog) return;
+      const bounds = elements.annotationFilterDialog.getBoundingClientRect();
+      if (event.clientX < bounds.left || event.clientX > bounds.right
+        || event.clientY < bounds.top || event.clientY > bounds.bottom) closeAnnotationFilter();
+    });
+    elements.annotationFilterDialog.addEventListener("close", () => {
+      document.body.classList.remove("dialog-open");
+      if (!elements.openFilterButton.disabled) elements.openFilterButton.focus();
+    });
     elements.deleteImageButton.addEventListener("click", deleteCurrentImage);
     elements.downloadAnnotatedButton.addEventListener("click", downloadAnnotatedData);
     elements.openStatisticsButton.addEventListener("click", openStatistics);
@@ -2484,8 +2771,12 @@
     elements.dataDirectoryDialog.addEventListener("close", () => {
       document.body.classList.remove("dialog-open");
     });
-    elements.search.addEventListener("input", applyListFilters);
-    elements.filter.addEventListener("change", applyListFilters);
+    const filterList = () => {
+      applyListFilters();
+      if (Object.keys(state.annotationFilters).length) reconcileFilteredSelection();
+    };
+    elements.search.addEventListener("input", filterList);
+    elements.filter.addEventListener("change", filterList);
     elements.previousButton.addEventListener("click", () => moveRelative(-1));
     elements.nextButton.addEventListener("click", () => moveRelative(1));
     elements.saveButton.addEventListener("click", () => saveAnnotation(false));
@@ -2560,7 +2851,7 @@
       if (elements.dataDirectoryDialog.open) return;
       const modifier = event.ctrlKey || event.metaKey;
       const key = event.key.toLowerCase();
-      if (elements.statisticsDialog.open) {
+      if (elements.statisticsDialog.open || elements.annotationFilterDialog.open) {
         const reservedShortcut = (modifier && (key === "s" || event.key === "Enter"))
           || (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight"));
         if (reservedShortcut) event.preventDefault();

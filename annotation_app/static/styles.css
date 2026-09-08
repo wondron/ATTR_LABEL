@@ -315,7 +315,7 @@ select:focus-visible {
 
 .image-sidebar {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   border-right: 1px solid var(--line);
   background: var(--surface);
 }
@@ -937,6 +937,152 @@ h2 {
 
 .download-button {
   margin: 0 14px 12px;
+}
+
+.annotation-filter-tools {
+  display: grid;
+  gap: 6px;
+  margin: 0 14px 10px;
+}
+
+.annotation-filter-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.annotation-filter-dialog {
+  width: min(800px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.annotation-filter-dialog::backdrop {
+  background: rgba(17, 24, 33, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.annotation-filter-modal {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 34px);
+}
+
+.annotation-filter-modal > header,
+.annotation-filter-footer {
+  flex-shrink: 0;
+}
+
+.annotation-filter-body {
+  overflow-y: auto;
+  padding: 16px 22px 22px;
+}
+
+.annotation-filter-help {
+  margin: 0 0 14px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.annotation-filter-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.annotation-filter-field {
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+
+.annotation-filter-field > label {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.annotation-filter-field select,
+.annotation-filter-values > input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.annotation-filter-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.annotation-filter-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.annotation-filter-choice:has(input:checked) {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.annotation-filter-choice input {
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.annotation-filter-footer {
+  padding: 12px 22px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.annotation-filter-footer .field-error {
+  margin: 0 0 8px;
+}
+
+.annotation-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.annotation-filter-action-spacer {
+  flex: 1;
+}
+
+@media (max-width: 580px) {
+  .annotation-filter-fields { grid-template-columns: minmax(0, 1fr); }
+  .annotation-filter-body { padding: 12px; }
+  .annotation-filter-footer { padding: 12px; }
+  .annotation-filter-actions { flex-wrap: wrap; }
 }
 
 .button--danger {
@@ -2043,7 +2189,7 @@ h2 {
 
   .image-sidebar {
     display: grid;
-    height: 260px;
+    height: 340px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }

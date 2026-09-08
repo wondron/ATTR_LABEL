@@ -316,7 +316,7 @@ class LinuxDirectorySwitchTests(unittest.TestCase):
         self.assertIn('apiRequest("/data-directory/select"', script)
         self.assertIn("directory_generation: state.directorySwitchGeneration", script)
         self.assertNotIn("webkitdirectory", html + script)
-        self.assertIn("app.js?v=linux-realtime-stats-2", html)
+        self.assertIn("app.js?v=annotation-filter-1", html)
 
     def test_empty_allowed_roots_are_restricted_to_initial_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

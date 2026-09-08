@@ -187,7 +187,7 @@ async function flush() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg")]) {
+async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg")], config = {}) {
   const root = path.resolve(__dirname, "..");
   const downloads = [];
   const document = makeDocument(fs.readFileSync(path.join(root, "annotation_app/static/index.html"), "utf8"), downloads);
@@ -206,12 +206,17 @@ async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg
       const handled = server.handler(request);
       if (handled !== undefined) return handled;
     }
-    if (request.path.endsWith("/config")) return response({ directory_generation: 0, data_dir: "/data/当前文件夹" });
+    if (request.path.endsWith("/config")) return response({ directory_generation: 0, data_dir: "/data/当前文件夹", ...config });
     if (request.path.endsWith("/health")) return response({ directory_generation: 0 });
     if (request.path.endsWith("/images")) return response(listPayload(server.images));
     if (request.path.endsWith("/annotation")) {
       const item = server.images.find((item) => item.id === request.params.get("image_id"));
-      return response({ exists: Boolean(item?.annotated), revision: item?.annotated ? "revision-1" : "__missing__", document: { annotations: { food_name: "已保存的包子" } } });
+      if (request.method === "PUT") {
+        const { annotations } = JSON.parse(request.options.body);
+        Object.assign(item, { annotated: true, annotation_exists: true, annotation_valid: true, annotations });
+        return response({ exists: true, revision: "revision-2", document: { annotations } });
+      }
+      return response({ exists: Boolean(item?.annotated), revision: item?.annotated ? "revision-1" : "__missing__", document: { annotations: item?.annotations ?? { food_name: "已保存的包子" } } });
     }
     if (request.path.endsWith("/image") && request.method === "DELETE") {
       server.images = server.images.filter((item) => item.id !== request.params.get("image_id"));
@@ -612,4 +617,275 @@ test("download reports no annotated data and uses the current folder ZIP filenam
   await flush();
   assert.deepEqual(app.downloads.map((item) => item.name), ["当前文件夹.zip"]);
   assert.equal(app.requests.findLast((request) => request.path.endsWith("/export")).params.get("directory_generation"), "0");
+});
+
+function annotatedImage(name, annotations) {
+  return { ...image(name, true), annotations };
+}
+
+function setAnnotationFilter(app, field, mode, value) {
+  const modeInput = app.get(`annotationFilterMode_${field}`);
+  assert.ok(modeInput, `the dialog must offer a filter for ${field}`);
+  modeInput.value = mode;
+  modeInput.dispatchEvent({ type: "change" });
+  if (value === undefined) return;
+  if (Array.isArray(value)) {
+    const choices = app.get(`annotationFilterChoices_${field}`).querySelectorAll('input[type="checkbox"]');
+    for (const expected of value) assert.ok(choices.some((choice) => choice.value === expected), `missing choice ${expected}`);
+    for (const choice of choices) {
+      choice.checked = value.includes(choice.value);
+      choice.dispatchEvent({ type: "change" });
+    }
+  } else {
+    const input = app.get(`annotationFilterValue_${field}`);
+    input.value = String(value);
+    input.dispatchEvent({ type: "input" });
+    input.dispatchEvent({ type: "change" });
+  }
+}
+
+async function applyAnnotationFilter(app) {
+  app.get("annotationFilterForm").dispatchEvent({ type: "submit" });
+  await flush();
+}
+
+test("attribute defaults include unannotated and missing fields, distinguish zero, and exclude invalid JSON", async () => {
+  const defaults = {
+    food_name: "无", food_count: null, quality: null, device_model: null,
+    container_type: ["无"], accessory_type: ["无"], rack_level: ["无"], food_size: null
+  };
+  const app = await createApp([
+    image("unannotated.jpg"),
+    annotatedImage("partial.jpg", { food_name: "无" }),
+    annotatedImage("explicit-defaults.jpg", defaults),
+    annotatedImage("zero-count.jpg", { ...defaults, food_count: 0 }),
+    { ...annotatedImage("invalid.jpg", defaults), annotation_valid: false }
+  ]);
+  app.get("openFilterButton").click();
+  assert.equal(app.get("annotationFilterDialog").open, true);
+  for (const field of Object.keys(defaults)) setAnnotationFilter(app, field, "default");
+  await applyAnnotationFilter(app);
+  assert.equal(app.get("annotationFilterDialog").open, false);
+  assert.deepEqual(app.visible(), ["unannotated.jpg", "partial.jpg", "explicit-defaults.jpg"]);
+  assert.equal(app.get("visibleCount").textContent, "3 张");
+  assert.equal(app.get("totalCount").textContent, "5", "folder totals must not become filtered totals");
+
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_count", "value", 0);
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["zero-count.jpg"]);
+  assert.equal(app.selected(), "zero-count.jpg");
+});
+
+test("configured defaults apply equally to missing fields and unannotated images", async () => {
+  const app = await createApp([
+    image("new.jpg"),
+    annotatedImage("missing-count.jpg", { food_name: "包子" }),
+    annotatedImage("two.jpg", { food_count: 2 }),
+    annotatedImage("explicit-null.jpg", { food_count: null })
+  ], { fields: [{ name: "food_count", default: 2 }] });
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_count", "default");
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["new.jpg", "missing-count.jpg", "two.jpg"]);
+});
+
+test("all eight attribute filters combine with AND, checkbox choices use OR, and filename/status filters remain active", async () => {
+  const matching = {
+    food_name: "蒸鸡蛋", food_count: 2, quality: 125.5, device_model: "C9277A", food_size: 4,
+    container_type: ["金属容器"], accessory_type: ["烤盘"], rack_level: ["1", "2"]
+  };
+  const app = await createApp([
+    annotatedImage("alpha-1.jpg", matching),
+    annotatedImage("alpha-2.jpg", { ...matching, container_type: ["陶瓷容器"] }),
+    annotatedImage("beta-1.jpg", matching),
+    annotatedImage("alpha-wrong.jpg", { ...matching, device_model: "DB677" }),
+    image("alpha-new.jpg")
+  ]);
+  app.get("imageSearch").value = "ALPHA";
+  app.get("imageSearch").dispatchEvent({ type: "input" });
+  app.get("statusFilter").value = "labeled";
+  app.get("statusFilter").dispatchEvent({ type: "change" });
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "contains", "鸡蛋");
+  setAnnotationFilter(app, "food_count", "value", "2");
+  setAnnotationFilter(app, "quality", "value", "125.50");
+  setAnnotationFilter(app, "food_size", "value", "4");
+  setAnnotationFilter(app, "device_model", "value", "C9277A");
+  setAnnotationFilter(app, "container_type", "value", ["金属容器", "陶瓷容器"]);
+  setAnnotationFilter(app, "accessory_type", "value", ["烤盘", "无孔蒸盘"]);
+  setAnnotationFilter(app, "rack_level", "value", ["1", "3"]);
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["alpha-1.jpg", "alpha-2.jpg"]);
+  app.get("nextButton").click();
+  await flush();
+  assert.equal(app.selected(), "alpha-2.jpg");
+  assert.equal(app.get("nextButton").disabled, true);
+  app.get("statusFilter").value = "unlabeled";
+  app.get("statusFilter").dispatchEvent({ type: "change" });
+  await flush();
+  assert.deepEqual(app.visible(), []);
+});
+
+test("cancel discards dialog edits, reset only changes draft conditions, and clear restores all images", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "鸡蛋" })
+  ]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "包子");
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["a.jpg"]);
+  for (const closeId of ["cancelAnnotationFilterButton", "closeAnnotationFilterButton"]) {
+    app.get("openFilterButton").click();
+    setAnnotationFilter(app, "food_name", "value", "鸡蛋");
+    app.get(closeId).click();
+    await flush();
+    assert.equal(app.get("annotationFilterDialog").open, false);
+    assert.deepEqual(app.visible(), ["a.jpg"]);
+    app.get("openFilterButton").click();
+    assert.equal(app.get("annotationFilterValue_food_name").value, "包子");
+    app.get("resetAnnotationFilterButton").click();
+    assert.equal(app.get("annotationFilterMode_food_name").value, "all");
+    assert.deepEqual(app.visible(), ["a.jpg"], "reset must not apply before submission");
+    app.get("cancelAnnotationFilterButton").click();
+  }
+  app.get("openFilterButton").click();
+  app.get("resetAnnotationFilterButton").click();
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["a.jpg", "b.jpg"]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "鸡蛋");
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), ["b.jpg"]);
+  app.get("clearAnnotationFilterButton").click();
+  await flush();
+  assert.deepEqual(app.visible(), ["a.jpg", "b.jpg"]);
+  assert.equal(app.selected(), "b.jpg", "clearing conditions should preserve a matching selection");
+});
+
+test("no matching attributes clear the preview and disable editing until conditions are cleared", async () => {
+  const app = await createApp([annotatedImage("a.jpg", { food_name: "包子" })]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "不存在的名称");
+  await applyAnnotationFilter(app);
+  assert.deepEqual(app.visible(), []);
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("previewImage").hidden, true);
+  assert.equal(app.get("emptyView").classList.contains("hidden"), false);
+  for (const id of ["annotationFields", "deleteImageButton", "saveButton", "previousButton", "nextButton"]) {
+    assert.equal(app.get(id).disabled, true, `${id} must be disabled without a matching image`);
+  }
+  assert.match(app.get("imageList").textContent, /没有匹配/);
+  app.get("clearAnnotationFilterButton").click();
+  await flush();
+  assert.equal(app.selected(), "a.jpg");
+  assert.equal(app.get("annotationFields").disabled, false);
+});
+
+test("applying a filter that removes a dirty image requires discard confirmation and preserves a cancelled draft", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "鸡蛋" })
+  ]);
+  app.edit("未保存的包子");
+  app.server.confirm = false;
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "鸡蛋");
+  await applyAnnotationFilter(app);
+  assert.equal(app.confirms.length, 1);
+  assert.equal(app.selected(), "a.jpg");
+  assert.equal(app.get("foodNameInput").value, "未保存的包子");
+  assert.equal(app.get("saveButton").disabled, false);
+  assert.deepEqual(app.visible(), ["a.jpg", "b.jpg"]);
+  assert.equal(app.get("annotationFilterDialog").open, true);
+  app.server.confirm = true;
+  await applyAnnotationFilter(app);
+  assert.equal(app.confirms.length, 2);
+  assert.deepEqual(app.visible(), ["b.jpg"]);
+  assert.equal(app.selected(), "b.jpg");
+  assert.equal(app.get("foodNameInput").value, "鸡蛋");
+});
+
+test("a filter retaining the current image uses saved values and preserves its unsaved form", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "鸡蛋" })
+  ]);
+  app.edit("未保存的名称");
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "包子");
+  await applyAnnotationFilter(app);
+  assert.equal(app.confirms.length, 0);
+  assert.deepEqual(app.visible(), ["a.jpg"]);
+  assert.equal(app.selected(), "a.jpg");
+  assert.equal(app.get("foodNameInput").value, "未保存的名称");
+  assert.equal(app.get("saveButton").disabled, false);
+});
+
+test("the filter dialog blocks deletion, saving, and navigation shortcuts even from its non-input controls", async () => {
+  const app = await createApp();
+  app.edit("保留筛查期间的草稿");
+  app.get("openFilterButton").click();
+  for (const key of ["d", "D", "e", "E", "q", "w", "ArrowLeft", "ArrowRight"]) {
+    app.key(key, app.get("resetAnnotationFilterButton"));
+  }
+  for (const key of ["ArrowLeft", "ArrowRight"]) app.key(key, app.document.body, { altKey: true });
+  app.key("s", app.document.body, { ctrlKey: true });
+  app.key("Enter", app.document.body, { metaKey: true });
+  await flush();
+  assert.equal(app.confirms.length, 0);
+  assert.equal(app.deletes().length, 0);
+  assert.equal(app.requests.filter((request) => request.method === "PUT").length, 0);
+  assert.equal(app.selected(), "第一张.jpg");
+  assert.equal(app.get("foodNameInput").value, "保留筛查期间的草稿");
+  assert.equal(app.get("annotationFilterDialog").open, true);
+});
+
+test("saving annotations refreshes attribute matches and advances when the saved image no longer matches", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "包子" }),
+    annotatedImage("c.jpg", { food_name: "鸡蛋" })
+  ]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "包子");
+  await applyAnnotationFilter(app);
+  app.edit("鸡蛋");
+  app.get("saveButton").click();
+  await flush();
+  assert.equal(app.requests.filter((request) => request.method === "PUT").length, 1);
+  assert.equal(app.server.images[0].annotations.food_name, "鸡蛋");
+  assert.deepEqual(app.visible(), ["b.jpg"]);
+  assert.equal(app.selected(), "b.jpg");
+  assert.equal(app.confirms.length, 0);
+  app.edit("鸡蛋");
+  app.get("saveNextButton").click();
+  await flush();
+  assert.deepEqual(app.visible(), []);
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("annotationFields").disabled, true);
+});
+
+test("live image updates obey applied filters and select a new matching image after the old match changes", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "鸡蛋" })
+  ]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "包子");
+  await applyAnnotationFilter(app);
+  app.server.images.push(annotatedImage("new-match.jpg", { food_name: "包子" }));
+  app.server.images.push(annotatedImage("new-other.jpg", { food_name: "鸡蛋" }));
+  await app.sync();
+  assert.deepEqual(app.visible(), ["a.jpg", "new-match.jpg"]);
+  assert.equal(app.selected(), "a.jpg");
+  app.server.images[0].annotations = { food_name: "鸡蛋" };
+  await app.sync();
+  assert.deepEqual(app.visible(), ["new-match.jpg"]);
+  assert.equal(app.selected(), "new-match.jpg");
+  app.server.images = app.server.images.filter((item) => item.id !== "new-match.jpg");
+  await app.sync();
+  assert.deepEqual(app.visible(), []);
+  assert.equal(app.selected(), null);
 });
