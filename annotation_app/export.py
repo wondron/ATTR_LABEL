@@ -1,4 +1,4 @@
-"""将已保存标注及原图流式写入临时 ZIP，避免把原图载入内存。"""
+"""按需校验已保存标注对应的原图，并流式写入临时 ZIP。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Font
 
 from .repository import AnnotationRepository, InvalidAnnotationFileError, RepositoryError
+from .watcher import DirectorySyncService
 
 
 EXCEL_HEADERS = (
@@ -100,6 +101,12 @@ def create_export_archive(
                     document, _ = repository.read_annotation(image_id)
                     if document is None:
                         continue
+                    # 目录清单只检查路径；导出时才校验已标注原图的完整内容。
+                    record = DirectorySyncService._read_record(image_path, repository.data_dir)
+                    if record is None or not DirectorySyncService._contents_complete(
+                        record, repository.data_dir,
+                    ):
+                        continue
                     values = document.annotations
                     row = [
                         image_id, values.food_name, values.food_count, values.quality,
@@ -108,12 +115,10 @@ def create_export_archive(
                     ]
                     rows.append([_excel_value(value, image_id) for value in row])
                     # 路径来自仓库的安全相对 ID；保留子目录以区分同名照片。
-                    before = image_path.stat()
                     archive.write(image_path, arcname=image_id)
-                    after = image_path.stat()
+                    after = DirectorySyncService._read_record(image_path, repository.data_dir)
                     if (
-                        (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
-                        != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino)
+                        after is None or after.stamp != record.stamp
                         or (is_image_ready is not None and not is_image_ready(image_id))
                     ):
                         raise RepositoryError(f"导出时图像仍在写入或已经变化，请稍后重试：{image_id}")

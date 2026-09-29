@@ -96,7 +96,7 @@ def _matches_stamp(metadata: os.stat_result, stamp: FileStamp, *, compare_ctime:
 
 
 def _ready_image_paths(snapshot: dict[str, ImageRecord]) -> list[Path]:
-    """只使用已完成校验且仍匹配磁盘版本的图片，避免重复遍历目录。"""
+    """复用路径索引并检查文件元数据，不读取或解码图片内容。"""
     paths = []
     for record in snapshot.values():
         try:
@@ -771,7 +771,6 @@ def create_app(
                             ],
                         },
                     )
-                await asyncio.to_thread(candidate.list_images)
             except HTTPException:
                 raise
             except (OSError, TypeError, ValueError) as exc:
@@ -818,7 +817,7 @@ def create_app(
 
         def collect_images() -> list[dict[str, Any]]:
             items = current_repository.list_images(_ready_image_paths(snapshot))
-            # 校验期间发生的新覆写也不能从列表绕过预览就绪检查。
+            # 收集标注期间已被覆盖或删除的路径等待索引刷新。
             return [item for item in items if directory_sync.is_ready(item["image_id"], current_generation)]
 
         try:
@@ -1085,6 +1084,9 @@ def create_app(
 
         record = directory_sync.ready_snapshot(current_generation).get(canonical_id)
         if record is None or record.path != image_path:
+            raise _image_not_ready()
+        # 只有访问该图片时才读取内容，目录列表和统计只使用路径索引。
+        if not await directory_sync.validate_image(canonical_id, current_generation):
             raise _image_not_ready()
         try:
             snapshot = await asyncio.to_thread(_copy_image_snapshot, record)

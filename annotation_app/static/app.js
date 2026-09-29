@@ -29,6 +29,8 @@
     annotationFilters: {},
     counts: { total: 0, labeled: 0, unlabeled: 0, invalid: 0 },
     currentImage: null,
+    hasSelectedImage: false,
+    rootPath: "",
     annotationExists: false,
     annotationInvalid: false,
     revision: null,
@@ -410,6 +412,17 @@
     return result;
   }
 
+  function setRootPath(path) {
+    const fullPath = String(path || "");
+    const parts = fullPath.split(/[\\/]+/).filter(Boolean);
+    const separator = fullPath.includes("\\") ? "\\" : "/";
+    state.rootPath = fullPath;
+    elements.rootPath.textContent = parts.length > 3
+      ? `…${separator}${parts.slice(-3).join(separator)}`
+      : fullPath;
+    elements.rootPath.title = fullPath;
+  }
+
   async function loadConfig() {
     try {
       const config = await apiRequest("/config");
@@ -420,16 +433,12 @@
       renderSchemaContract();
       renderDeviceModelOptions(state.draft.device_model);
       const root = state.config.image_root || state.config.root || state.config.image_dir || state.config.data_dir || "10-temp_label";
-      elements.rootPath.textContent = root;
-      elements.rootPath.title = root;
+      setRootPath(root);
     } catch (error) {
       state.options = cloneOptions(DEFAULT_OPTIONS);
       renderSchemaContract();
       renderDeviceModelOptions(state.draft.device_model);
-      const currentRoot = elements.rootPath.textContent.trim();
-      if (!currentRoot || currentRoot.includes("正在连接")) {
-        elements.rootPath.textContent = "10-temp_label";
-      }
+      if (!state.rootPath) setRootPath("10-temp_label");
       showToast("配置读取失败", `${error.message}；已使用内置枚举。`, "warning", 6500);
     } finally {
       // 统计只依赖当前目录配置，无需等待完整图片列表扫描结束。
@@ -637,6 +646,7 @@
       )) loadPreview(state.currentImage);
 
       const canAutoSelect = Boolean(settings.autoSelectFirst)
+        && state.hasSelectedImage
         && !state.currentImage
         && !state.loadingAnnotation
         && !state.saving;
@@ -778,8 +788,7 @@
     scheduleImageCalibration();
   }
 
-  async function loadImages(options) {
-    const settings = options || {};
+  async function loadImages() {
     showListLoading();
     try {
       const payload = await apiRequest(withDirectoryGeneration("/images"));
@@ -788,9 +797,6 @@
       updateStats();
       applyListFilters();
       setServiceStatus("online", "服务正常");
-      if (state.filteredImages.length && settings.selectFirst !== false) {
-        await selectImage(state.filteredImages[0].id, { skipPrompt: true });
-      }
       return true;
     } catch (error) {
       if (isDirectoryChangedError(error)) {
@@ -810,7 +816,7 @@
     if (state.downloading || state.switchingFolder || state.deleting || state.directoryStale || state.directoryGeneration == null) return;
     state.downloading = true;
     const generation = state.directoryGeneration;
-    const folderName = String(state.config && state.config.data_dir || elements.rootPath.textContent)
+    const folderName = String(state.config && state.config.data_dir || state.rootPath)
       .replace(/\\/g, "/").split("/").filter(Boolean).pop() || "已标注数据";
     updateControls();
     try {
@@ -1216,6 +1222,7 @@
     state.filteredImages = [];
     state.counts = { total: 0, labeled: 0, unlabeled: 0, invalid: 0 };
     state.currentImage = null;
+    state.hasSelectedImage = false;
     state.annotationExists = false;
     state.annotationInvalid = false;
     state.revision = null;
@@ -1237,8 +1244,7 @@
     state.annotationFilters = {};
     closeAnnotationFilter();
     updateAnnotationFilterSummary();
-    elements.rootPath.textContent = dataDir;
-    elements.rootPath.title = dataDir;
+    setRootPath(dataDir);
     elements.currentFileName.textContent = "尚未选择图像";
     elements.currentFileName.title = "";
     elements.positionText.textContent = "0 / 0";
@@ -1287,7 +1293,7 @@
     state.directoryBrowseParentPath = null;
     state.directorySelectedPath = "";
     const currentPath = String(
-      dialogConfig.data_dir || elements.rootPath.textContent || ""
+      dialogConfig.data_dir || state.rootPath || ""
     ).trim();
     const allowedRoots = Array.isArray(dialogConfig.allowed_data_roots)
       ? dialogConfig.allowed_data_roots.map((item) => String(item)).filter(Boolean)
@@ -1361,8 +1367,7 @@
       const generationChanged = selectedGeneration !== state.directoryGeneration;
       if (!result.changed && !generationChanged && !wasDirectoryStale) {
         if (dataDir) {
-          elements.rootPath.textContent = dataDir;
-          elements.rootPath.title = dataDir;
+          setRootPath(dataDir);
         }
         elements.dataDirectoryDialog.close();
         document.body.classList.remove("dialog-open");
@@ -1377,7 +1382,7 @@
       resetWorkspaceForDirectorySwitch(dataDir, selectedGeneration);
       await loadConfig();
       renderAllChoiceGroups();
-      const loaded = await loadImages({ selectFirst: false });
+      const loaded = await loadImages();
       setFolderSwitchBusy(false);
       busyReleased = true;
       if (loaded) {
@@ -1390,10 +1395,6 @@
       }
 
       startImageRealtimeSync();
-
-      if (loaded && state.filteredImages.length) {
-        await selectImage(state.filteredImages[0].id, { skipPrompt: true });
-      }
     } catch (error) {
       if (isDirectoryChangedError(error)) {
         elements.dataDirectoryDialog.close();
@@ -1950,7 +1951,7 @@
   }
 
   async function reconcileFilteredSelection(preferredIndex = 0) {
-    if (state.dirty || state.saving || state.deleting || state.loadingAnnotation
+    if (!state.hasSelectedImage || state.dirty || state.saving || state.deleting || state.loadingAnnotation
       || state.switchingFolder || state.directoryStale) return;
     if (state.currentImage && currentFilteredIndex() >= 0) return;
     const target = state.filteredImages[Math.max(0, Math.min(preferredIndex, state.filteredImages.length - 1))];
@@ -2090,6 +2091,7 @@
 
     const sequence = ++state.loadSequence;
     state.currentImage = nextImage;
+    state.hasSelectedImage = true;
     state.annotationExists = Boolean(nextImage.annotated);
     state.annotationInvalid = Boolean(nextImage.annotated && nextImage.annotation_valid === false);
     state.revision = null;

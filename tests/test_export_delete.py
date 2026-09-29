@@ -111,6 +111,33 @@ class ExportDeleteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"]["message"], "暂无已标注数据可下载")
 
+    def test_export_checks_only_labeled_image_contents_and_skips_incomplete_images(self) -> None:
+        names = ("complete.jpg", "corrupt.jpg", "truncated.jpg", "unlabeled.jpg")
+        for name in names:
+            make_image(self.root / name)
+        repository = AnnotationRepository(self.root)
+        for name in names[:-1]:
+            save_example(repository, name)
+        (self.root / "corrupt.jpg").write_bytes(b"not an image")
+        truncated = self.root / "truncated.jpg"
+        truncated.write_bytes(truncated.read_bytes()[:-2])
+
+        # All four paths are listed: readiness no longer implies decoded pixels.
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            generated = create_export_archive(repository, is_image_ready=lambda _: True)
+        self.addCleanup(generated.cleanup)
+        self.assertEqual(
+            {Path(call.args[0]).name for call in opened.call_args_list},
+            set(names[:-1]),
+        )
+        with ZipFile(generated.path) as archive:
+            self.assertEqual(set(archive.namelist()), {"complete.jpg", "标注数据.xlsx"})
+            self.assertEqual(archive.read("complete.jpg"), (self.root / "complete.jpg").read_bytes())
+            workbook = load_workbook(io.BytesIO(archive.read("标注数据.xlsx")))
+        self.addCleanup(workbook.close)
+        self.assertEqual(workbook.active.max_row, 2)
+        self.assertEqual(workbook.active.cell(2, 1).value, "complete.jpg")
+
     def test_corrupt_annotation_stops_export_and_cleans_temporary_directory(self) -> None:
         make_image(self.root / "损坏.jpg")
         (self.root / "损坏.json").write_text("{broken", encoding="utf-8")

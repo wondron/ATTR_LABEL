@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -125,9 +126,8 @@ class _WatchdogEventHandler(FileSystemEventHandler):  # type: ignore[misc]
 class DirectorySyncService:
     """Watch one recursive image tree and fan changes out to SSE clients.
 
-    Files are not announced until their metadata has settled and their full
-    image contents decode successfully. A paused, truncated camera write must
-    not become visible merely because its size briefly stopped changing.
+    Directory scans only collect paths and filesystem metadata. Image contents
+    are validated on demand when a user requests an individual image.
     """
 
     def __init__(
@@ -191,18 +191,18 @@ class DirectorySyncService:
     def ready_snapshot(
         self, generation: int | None = None,
     ) -> dict[str, ImageRecord]:
-        """Return validated signatures, keyed by the original image IDs.
+        """Return indexed metadata, keyed by the original image IDs.
 
         Listing code must compare these stamps with its current disk scan;
         an already published image may since have been replaced or deleted.
-        Use ``is_ready`` to guard an individual image response.
+        Use ``validate_image`` before serving an individual image response.
         """
         if generation is not None and generation != self._generation:
             return {}
         return {record.image_id: record for record in self._known.values()}
 
     def is_ready(self, image_id: str, generation: int | None = None) -> bool:
-        """Check that a file still matches its validated contents on disk."""
+        """Check that a file still matches its indexed metadata on disk."""
         if generation is not None and generation != self._generation:
             return False
         root = self._root
@@ -216,6 +216,36 @@ class DirectorySyncService:
             and self._known.get(self._id_key(image_id)) == previous
             and current is not None
             and current.stamp == previous.stamp
+        )
+
+    async def validate_image(
+        self, image_id: str, generation: int | None = None,
+    ) -> bool:
+        """Read and validate only the requested image, rejecting stale results."""
+        expected_generation = self._generation if generation is None else generation
+        if expected_generation != self._generation:
+            return False
+        root = self._root
+        key = self._id_key(image_id)
+        record = self._known.get(key)
+        if root is None or record is None:
+            return False
+        current = await asyncio.to_thread(self._read_record, record.path, root)
+        if (
+            root != self._root
+            or expected_generation != self._generation
+            or self._known.get(key) != record
+            or current != record
+        ):
+            return False
+        if not await self._validate_record(record, root):
+            return False
+        current = await asyncio.to_thread(self._read_record, record.path, root)
+        return (
+            root == self._root
+            and expected_generation == self._generation
+            and self._known.get(key) == record
+            and current == record
         )
 
     @property
@@ -253,6 +283,7 @@ class DirectorySyncService:
             if wait_for_initial_scan:
                 await self._prime_directory()
                 self._initial_scan_complete = True
+                self._publish("resync", details={"reason": "initial_scan_complete"})
             else:
                 root, current_generation = self._root, self._generation
                 self._prime_task = asyncio.create_task(
@@ -378,48 +409,26 @@ class DirectorySyncService:
                 and task is self._prime_task
             ):
                 self._initial_scan_complete = True
+                self._publish("resync", details={"reason": "initial_scan_complete"})
 
     async def _prime_directory(self) -> None:
-        """Seed existing images through the same readiness gate as new files.
-
-        Take two directory samples once, then validate at most four files in
-        parallel. Incomplete files are retried in the background; they never
-        hold startup or a directory switch open for the stability timeout.
-        """
+        """Index an existing tree in one metadata-only traversal."""
         root, generation = self._root, self._generation
         if root is None:
             return
         initial = await asyncio.to_thread(self._scan_directory, root)
-        if not initial:
+        if (
+            initial is None
+            or not self._running
+            or generation != self._generation
+            or root != self._root
+        ):
             return
-        await asyncio.sleep(self._stability_interval)
-        seed_slots = asyncio.Semaphore(4)
-
-        async def seed(previous: ImageRecord) -> None:
-            async with seed_slots:
-                current = await asyncio.to_thread(self._read_record, previous.path, root)
-                if current is None:
-                    return
-                valid = (
-                    current.stamp.size > 0
-                    and current.stamp == previous.stamp
-                    and await self._validate_record(current, root)
-                )
-                if not self._running or generation != self._generation or root != self._root:
-                    return
-                if valid:
-                    key = self._id_key(current.image_id)
-                    known = self._known.get(key)
-                    self._known[key] = current
-                    if known is None or known.stamp != current.stamp:
-                        self._publish(
-                            "created" if known is None else "modified",
-                            image_id=current.image_id,
-                        )
-                else:
-                    self._put_raw_event(RawWatchEvent("created", generation, current.path))
-
-        await asyncio.gather(*(seed(record) for record in initial.values()))
+        for key, record in initial.items():
+            # A filesystem event may have indexed a newer version while the
+            # scan was running in its worker thread.
+            if key not in self._known:
+                self._known[key] = record
 
     def subscribe(
         self, generation: int
@@ -662,16 +671,10 @@ class DirectorySyncService:
                 return None
             if record is None:
                 return None
-            if record.stamp.size <= 0:
-                previous = None
-                equal_samples = 1
-            elif previous is not None and previous.stamp == record.stamp:
+            if previous is not None and previous.stamp == record.stamp:
                 equal_samples += 1
                 if equal_samples >= self._stable_samples:
-                    if await self._validate_record(record, root):
-                        if generation == self._generation and root == self._root:
-                            return record
-                        return None
+                    return record
             else:
                 previous = record
                 equal_samples = 1
@@ -681,18 +684,19 @@ class DirectorySyncService:
 
     async def _validate_record(self, record: ImageRecord, root: Path) -> bool:
         key = self._id_key(record.image_id)
+        generation = self._generation
         loop = asyncio.get_running_loop()
         async with self._validation_slots:
             cached = self._validation_cache.get(key)
             if cached is not None and cached[0] == record.stamp:
                 # Retry failures occasionally: a sharing violation can clear
                 # without changing metadata. Never repeatedly decode a large
-                # incomplete image at every stability probe.
+                # incomplete image on repeated image requests.
                 if cached[1] or loop.time() - cached[2] < 2.0:
                     current = await asyncio.to_thread(self._read_record, record.path, root)
                     return cached[1] and current is not None and current.stamp == record.stamp
             valid = await asyncio.to_thread(self._contents_complete, record, root)
-            if root == self._root:
+            if root == self._root and generation == self._generation:
                 self._validation_cache[key] = (record.stamp, valid, loop.time())
             return valid
 
@@ -711,8 +715,9 @@ class DirectorySyncService:
                 candidate.verify()
             # Pillow can accept PNGs missing the last IEND checksum bytes and
             # GIFs missing their trailer, even with strict pixel decoding.
-            # Require the container's closing marker before publishing them.
+            # Require the container's closing marker before serving them.
             trailer = {
+                "JPEG": b"\xff\xd9",
                 "PNG": b"\x00\x00\x00\x00IEND\xaeB\x60\x82",
                 "GIF": b";",
             }.get(image_format)
@@ -737,7 +742,6 @@ class DirectorySyncService:
                 await asyncio.shield(initial_scan)
                 if not self._running:
                     return
-                await self._reconcile_once()
             while self._running:
                 interval = (
                     self._observer_reconcile_interval
@@ -933,10 +937,12 @@ class DirectorySyncService:
             return None
         try:
             resolved = path.resolve(strict=True)
-            relative = resolved.relative_to(root)
-            if not resolved.is_file():
+            if resolved != Path(os.path.abspath(os.fspath(path))):
                 return None
+            relative = resolved.relative_to(root)
             stat_result = resolved.stat()
+            if not stat.S_ISREG(stat_result.st_mode):
+                return None
         except (OSError, ValueError):
             return None
         image_id = PurePosixPath(*relative.parts).as_posix()
@@ -946,27 +952,49 @@ class DirectorySyncService:
     def _scan_directory(cls, root: Path) -> dict[str, ImageRecord] | None:
         records: dict[str, ImageRecord] = {}
         walk_failed = False
-
-        def on_error(exc: OSError) -> None:
-            nonlocal walk_failed
-            walk_failed = True
-            LOGGER.warning("Unable to scan part of image directory %s: %s", root, exc)
-
-        try:
-            for directory, _subdirectories, filenames in os.walk(
-                root, onerror=on_error, followlinks=False
-            ):
-                base = Path(directory)
-                for filename in filenames:
-                    path = base / filename
-                    if path.suffix.lower() not in IMAGE_SUFFIXES:
-                        continue
-                    record = cls._read_record(path, root)
-                    if record is not None:
-                        records[cls._id_key(record.image_id)] = record
-        except OSError as exc:
-            LOGGER.warning("Unable to scan image directory %s: %s", root, exc)
-            return None
+        pending = [(root, "")]
+        while pending:
+            directory, prefix = pending.pop()
+            try:
+                # Resolve once per directory, rather than for every image, and
+                # do not follow directories replaced with links during a scan.
+                if directory.resolve(strict=True) != directory:
+                    continue
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            if not is_directory and Path(entry.name).suffix.lower() not in IMAGE_SUFFIXES:
+                                continue
+                            metadata = entry.stat(follow_symlinks=False)
+                            if getattr(metadata, "st_file_attributes", 0) & 0x400:
+                                # Windows junctions and other reparse points.
+                                continue
+                            relative = f"{prefix}{entry.name}"
+                            path = directory / entry.name
+                            if is_directory:
+                                pending.append((path, f"{relative}/"))
+                            elif stat.S_ISREG(metadata.st_mode):
+                                # Windows DirEntry.stat() omits the file ID and
+                                # can cache stale metadata. One path stat keeps
+                                # stamps comparable with per-image checks.
+                                if os.name == "nt":
+                                    metadata = path.stat(follow_symlinks=False)
+                                    if (
+                                        not stat.S_ISREG(metadata.st_mode)
+                                        or getattr(metadata, "st_file_attributes", 0) & 0x400
+                                    ):
+                                        continue
+                                record = ImageRecord(relative, path, cls._stamp(metadata))
+                                records[cls._id_key(relative)] = record
+                        except FileNotFoundError:
+                            # Files may disappear between scandir and stat.
+                            continue
+            except OSError as exc:
+                walk_failed = True
+                LOGGER.warning("Unable to scan part of image directory %s: %s", root, exc)
         # A partial network/permission scan must not generate a delete storm.
         return None if walk_failed else records
 

@@ -237,7 +237,7 @@ async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg
   sandboxURL.createObjectURL = () => "blob:test-download";
   sandboxURL.revokeObjectURL = () => {};
   vm.runInNewContext(fs.readFileSync(path.join(root, "annotation_app/static/app.js"), "utf8"), {
-    window, document, HTMLElement: Element, Element, fetch, URL: sandboxURL, Blob, console,
+    window, document, HTMLElement: Element, Element, fetch, URL: sandboxURL, URLSearchParams, Blob, console,
     setTimeout: window.setTimeout, clearTimeout: window.clearTimeout,
   }, { filename: "app.js" });
   await flush();
@@ -247,6 +247,12 @@ async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg
     visible: () => document.getElementById("imageList").querySelectorAll(".image-item").map((item) => item.dataset.imageId),
     deletes: () => requests.filter((request) => request.method === "DELETE"),
     selected: () => document.getElementById("previewImage").dataset.imageId || null,
+    async select(id) {
+      const item = app.get("imageList").querySelectorAll(".image-item").find((item) => item.dataset.imageId === id);
+      assert.ok(item, `image ${id} must be listed before selection`);
+      item.click();
+      await flush();
+    },
     key(key, target = document.body, extra = {}) {
       const event = { type: "keydown", key, target, ctrlKey: false, metaKey: false, altKey: false, repeat: false, ...extra };
       target.dispatchEvent(event);
@@ -268,8 +274,106 @@ async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg
   return app;
 }
 
-test("D does not delete while typing, composing, repeating, or using modifiers", async () => {
+async function createSelectedApp(...args) {
+  const app = await createApp(...args);
+  if (app.visible().length) await app.select(app.visible()[0]);
+  return app;
+}
+
+test("startup and live refresh list paths without loading images until a row is clicked", async () => {
   const app = await createApp();
+  assert.deepEqual(app.visible(), ["第一张.jpg", "第二张.jpg"]);
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("previewImage").getAttribute("src"), null);
+  assert.equal(app.requests.filter((request) => request.path.endsWith("/annotation")).length, 0);
+  app.sources.at(-1).onopen();
+  await app.tick(0);
+  app.server.images.push(image("新图.jpg"));
+  await app.sync();
+  await app.tick(15000);
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("previewImage").getAttribute("src"), null);
+  assert.equal(app.requests.filter((request) => request.path.endsWith("/annotation")).length, 0);
+  await app.select("第二张.jpg");
+  assert.equal(app.selected(), "第二张.jpg");
+  assert.match(app.get("previewImage").src, /image_id=/);
+  assert.deepEqual(app.requests.filter((request) => request.path.endsWith("/annotation"))
+    .map((request) => request.params.get("image_id")), ["第二张.jpg"]);
+});
+
+test("root label keeps the final three path components and directory browsing uses the full path", async () => {
+  for (const [root, expected] of [
+    ["/mnt/archive/project/session/photos", "…/project/session/photos"],
+    ["F:\\archive\\project\\session\\photos", "…\\project\\session\\photos"],
+    ["/data/photos", "/data/photos"],
+    ["/", "/"]
+  ]) {
+    const app = await createApp([], { image_root: root, data_dir: undefined });
+    assert.equal(app.get("rootPath").textContent, expected);
+    assert.equal(app.get("rootPath").title, root);
+    if (!root.startsWith("/")) continue;
+    app.server.handler = (request) => request.path.endsWith("/data-directories")
+      ? response({ directory_generation: 0, current_path: root, directories: [] })
+      : undefined;
+    app.get("chooseDataDirButton").click();
+    await flush();
+    assert.equal(app.get("dataDirectoryPathInput").value, root);
+    assert.equal(app.requests.findLast((request) => request.path.endsWith("/data-directories")).params.get("path"), root);
+  }
+});
+
+test("switching folders clears a selected image and waits for another click before loading", async () => {
+  const app = await createSelectedApp();
+  const newRoot = "/mnt/archive/project/session/new-photos";
+  let switched = false;
+  app.server.handler = (request) => {
+    if (request.path.endsWith("/data-directories")) {
+      return response({ directory_generation: 0, current_path: "/data", directories: [{ path: newRoot }] });
+    }
+    if (request.path.endsWith("/data-directory/select")) {
+      assert.equal(JSON.parse(request.options.body).path, newRoot);
+      switched = true;
+      app.server.images = [image("新目录.jpg")];
+      return response({ directory_generation: 1, data_dir: newRoot, changed: true });
+    }
+    if (switched && request.path.endsWith("/config")) return response({ directory_generation: 1, data_dir: newRoot });
+    if (switched && request.path.endsWith("/images")) return response({ ...listPayload(app.server.images), directory_generation: 1 });
+    return undefined;
+  };
+  const loadedAnnotations = app.requests.filter((request) => request.path.endsWith("/annotation")).length;
+  app.get("chooseDataDirButton").click();
+  await flush();
+  app.get("dataDirectoryList").querySelector(".directory-browser-item").click();
+  app.get("dataDirectoryForm").dispatchEvent({ type: "submit" });
+  await flush();
+  app.sources.at(-1).onopen();
+  await app.tick(0);
+  assert.deepEqual(app.visible(), ["新目录.jpg"]);
+  assert.equal(app.get("rootPath").textContent, "…/project/session/new-photos");
+  assert.equal(app.get("rootPath").title, newRoot);
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("previewImage").getAttribute("src"), null);
+  assert.equal(app.requests.filter((request) => request.path.endsWith("/annotation")).length, loadedAnnotations);
+  await app.select("新目录.jpg");
+  assert.equal(app.selected(), "新目录.jpg");
+  assert.equal(app.requests.findLast((request) => request.path.endsWith("/annotation")).params.get("directory_generation"), "1");
+});
+
+test("applying filters before the first click leaves matching images unloaded", async () => {
+  const app = await createApp([annotatedImage("a.jpg", { food_name: "包子" }), annotatedImage("b.jpg", { food_name: "鸡蛋" })]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "value", "鸡蛋");
+  await applyAnnotationFilter(app);
+  await app.sync();
+  assert.deepEqual(app.visible(), ["b.jpg"]);
+  assert.equal(app.selected(), null);
+  assert.equal(app.requests.filter((request) => request.path.endsWith("/annotation")).length, 0);
+  await app.select("b.jpg");
+  assert.equal(app.selected(), "b.jpg");
+});
+
+test("D does not delete while typing, composing, repeating, or using modifiers", async () => {
+  const app = await createSelectedApp();
   for (const tag of ["input", "select", "textarea"]) {
     const field = app.document.createElement(tag);
     app.document.body.append(field);
@@ -291,7 +395,7 @@ test("D does not delete while typing, composing, repeating, or using modifiers",
 });
 
 test("button and D both confirm the filename and permanent deletion; cancel preserves draft", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("未保存的饺子");
   app.server.confirm = false;
   app.get("deleteImageButton").click();
@@ -309,7 +413,7 @@ test("button and D both confirm the filename and permanent deletion; cancel pres
 });
 
 test("successful deletion selects next image and removing the last image shows empty state", async () => {
-  const app = await createApp([image("第一张.jpg", true), image("第二张.jpg")]);
+  const app = await createSelectedApp([image("第一张.jpg", true), image("第二张.jpg")]);
   app.key("D");
   await flush();
   assert.equal(app.deletes().length, 1);
@@ -331,7 +435,7 @@ test("successful deletion selects next image and removing the last image shows e
 });
 
 test("deletion in flight cannot be submitted twice or switch the selected image", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   const pending = deferred();
   app.server.handler = (request) => request.method === "DELETE" ? pending.promise : undefined;
   app.key("d");
@@ -348,7 +452,7 @@ test("deletion in flight cannot be submitted twice or switch the selected image"
 });
 
 test("partial failure keeps the remaining original and updates removed annotation status", async () => {
-  const app = await createApp([image("第一张.jpg", true), image("第二张.jpg")]);
+  const app = await createSelectedApp([image("第一张.jpg", true), image("第二张.jpg")]);
   app.edit("保留未保存内容");
   app.server.handler = (request) => {
     if (request.method !== "DELETE") return undefined;
@@ -366,7 +470,7 @@ test("partial failure keeps the remaining original and updates removed annotatio
 });
 
 test("partial deletion of a saved annotation marks the preserved form as an unsaved draft", async () => {
-  const app = await createApp([image("第一张.jpg", true)]);
+  const app = await createSelectedApp([image("第一张.jpg", true)]);
   app.server.handler = (request) => {
     if (request.method !== "DELETE") return undefined;
     Object.assign(app.server.images[0], { annotated: false, annotation_exists: false, annotation_valid: null });
@@ -385,7 +489,7 @@ test("partial deletion of a saved annotation marks the preserved form as an unsa
 });
 
 test("a failed delete response reconciles with the actual image list", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.server.handler = (request) => {
     if (request.method !== "DELETE") return undefined;
     app.server.images.shift();
@@ -400,7 +504,7 @@ test("a failed delete response reconciles with the actual image list", async () 
 });
 
 test("known deletion result remains reflected when list reconciliation fails", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.server.handler = (request) => {
     if (request.method === "DELETE") {
       app.server.images.shift();
@@ -417,7 +521,7 @@ test("known deletion result remains reflected when list reconciliation fails", a
 });
 
 test("unknown disk state disables saving until reconnect confirms deletion", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("断线前未保存的包子");
   app.server.handler = (request) => {
     if (request.method === "DELETE") {
@@ -440,7 +544,7 @@ test("unknown disk state disables saving until reconnect confirms deletion", asy
 });
 
 test("reconnect after uncertain partial deletion preserves draft and permits a fresh annotation save", async () => {
-  const app = await createApp([image("第一张.jpg", true)]);
+  const app = await createSelectedApp([image("第一张.jpg", true)]);
   app.edit("保留断线期间的修改");
   app.server.handler = (request) => {
     if (request.method === "DELETE") {
@@ -467,7 +571,7 @@ test("reconnect after uncertain partial deletion preserves draft and permits a f
 });
 
 test("live refresh preserves selected image, form draft, and annotation request count", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("新鲜蒸饺，尚未保存");
   const before = app.requests.filter((request) => request.path.endsWith("/annotation")).length;
   app.server.images.unshift(image("刚拍摄.jpg"));
@@ -484,7 +588,7 @@ test("live refresh preserves selected image, form draft, and annotation request 
 });
 
 test("late list responses cannot resurrect an image after a completed deletion", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   const oldList = listPayload(app.server.images);
   const pending = deferred();
   let interceptNextList = true;
@@ -502,17 +606,19 @@ test("late list responses cannot resurrect an image after a completed deletion",
   assert.equal(app.get("totalCount").textContent, "1");
 });
 
-test("first newly written image is automatically selected from empty state", async () => {
+test("first newly written image waits for a click when the folder started empty", async () => {
   const app = await createApp([]);
   assert.equal(app.selected(), null);
   app.server.images.push(image("新拍摄.jpg"));
   await app.sync();
-  assert.equal(app.selected(), "新拍摄.jpg");
+  assert.equal(app.selected(), null);
+  assert.equal(app.get("previewImage").getAttribute("src"), null);
+  assert.equal(app.requests.filter((request) => request.path.endsWith("/annotation")).length, 0);
   assert.equal(app.get("totalCount").textContent, "1");
 });
 
 test("continuous camera events cannot keep postponing the first list refresh", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   const source = app.sources.at(-1);
   const emit = () => source.dispatchEvent({ type: "image-created", data: JSON.stringify({ type: "image-created", directory_generation: 0 }), bubbles: false });
   const before = app.requests.filter((request) => request.path.endsWith("/images")).length;
@@ -526,7 +632,7 @@ test("continuous camera events cannot keep postponing the first list refresh", a
 });
 
 test("event-stream reconnect reconciles photographs written during the subscription gap", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.server.images.push(image("订阅空隙新增.jpg"));
   app.sources.at(-1).onopen();
   await app.tick(0);
@@ -535,7 +641,7 @@ test("event-stream reconnect reconciles photographs written during the subscript
 });
 
 test("event-stream failure falls back to polling without a manual page refresh", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.server.images.push(image("轮询新增.jpg"));
   app.sources.at(-1).onerror();
   await app.tick(2000);
@@ -545,7 +651,7 @@ test("event-stream failure falls back to polling without a manual page refresh",
 });
 
 test("transient preview load errors retry without replacing an unsaved annotation", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("保持草稿");
   const preview = app.get("previewImage");
   const originalSource = preview.src;
@@ -562,7 +668,7 @@ test("transient preview load errors retry without replacing an unsaved annotatio
 });
 
 test("changing images cancels a pending retry for the previous preview", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   const preview = app.get("previewImage");
   preview.dispatchEvent({ type: "error", bubbles: false });
   app.get("nextButton").click();
@@ -574,7 +680,7 @@ test("changing images cancels a pending retry for the previous preview", async (
 });
 
 test("D cannot delete through either modal dialog", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   for (const id of ["statisticsDialog", "dataDirectoryDialog"]) {
     app.get(id).showModal();
     app.key("d");
@@ -585,7 +691,7 @@ test("D cannot delete through either modal dialog", async () => {
 });
 
 test("a directory-generation conflict preserves draft and prevents subsequent deletion", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("原目录未保存内容");
   app.server.handler = (request) => request.method === "DELETE"
     ? response({ detail: { code: "data_directory_changed", message: "目录已在其他页面切换", directory_generation: 1, data_dir: "/data/other" } }, 409)
@@ -602,7 +708,7 @@ test("a directory-generation conflict preserves draft and prevents subsequent de
 });
 
 test("download reports no annotated data and uses the current folder ZIP filename", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.server.handler = (request) => request.path.endsWith("/export")
     ? response({ detail: { code: "no_annotated_data", message: "暂无已标注数据可下载" } }, 404)
     : undefined;
@@ -654,7 +760,7 @@ test("attribute defaults include unannotated and missing fields, distinguish zer
     food_name: "无", food_count: null, quality: null, device_model: null,
     container_type: ["无"], accessory_type: ["无"], rack_level: ["无"], food_size: null
   };
-  const app = await createApp([
+  const app = await createSelectedApp([
     image("unannotated.jpg"),
     annotatedImage("partial.jpg", { food_name: "无" }),
     annotatedImage("explicit-defaults.jpg", defaults),
@@ -678,7 +784,7 @@ test("attribute defaults include unannotated and missing fields, distinguish zer
 });
 
 test("configured defaults apply equally to missing fields and unannotated images", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     image("new.jpg"),
     annotatedImage("missing-count.jpg", { food_name: "包子" }),
     annotatedImage("two.jpg", { food_count: 2 }),
@@ -695,7 +801,7 @@ test("all eight attribute filters combine with AND, checkbox choices use OR, and
     food_name: "蒸鸡蛋", food_count: 2, quality: 125.5, device_model: "C9277A", food_size: 4,
     container_type: ["金属容器"], accessory_type: ["烤盘"], rack_level: ["1", "2"]
   };
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("alpha-1.jpg", matching),
     annotatedImage("alpha-2.jpg", { ...matching, container_type: ["陶瓷容器"] }),
     annotatedImage("beta-1.jpg", matching),
@@ -728,7 +834,7 @@ test("all eight attribute filters combine with AND, checkbox choices use OR, and
 });
 
 test("cancel discards dialog edits, reset only changes draft conditions, and clear restores all images", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("a.jpg", { food_name: "包子" }),
     annotatedImage("b.jpg", { food_name: "鸡蛋" })
   ]);
@@ -765,7 +871,7 @@ test("cancel discards dialog edits, reset only changes draft conditions, and cle
 });
 
 test("no matching attributes clear the preview and disable editing until conditions are cleared", async () => {
-  const app = await createApp([annotatedImage("a.jpg", { food_name: "包子" })]);
+  const app = await createSelectedApp([annotatedImage("a.jpg", { food_name: "包子" })]);
   app.get("openFilterButton").click();
   setAnnotationFilter(app, "food_name", "value", "不存在的名称");
   await applyAnnotationFilter(app);
@@ -784,7 +890,7 @@ test("no matching attributes clear the preview and disable editing until conditi
 });
 
 test("applying a filter that removes a dirty image requires discard confirmation and preserves a cancelled draft", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("a.jpg", { food_name: "包子" }),
     annotatedImage("b.jpg", { food_name: "鸡蛋" })
   ]);
@@ -808,7 +914,7 @@ test("applying a filter that removes a dirty image requires discard confirmation
 });
 
 test("a filter retaining the current image uses saved values and preserves its unsaved form", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("a.jpg", { food_name: "包子" }),
     annotatedImage("b.jpg", { food_name: "鸡蛋" })
   ]);
@@ -824,7 +930,7 @@ test("a filter retaining the current image uses saved values and preserves its u
 });
 
 test("the filter dialog blocks deletion, saving, and navigation shortcuts even from its non-input controls", async () => {
-  const app = await createApp();
+  const app = await createSelectedApp();
   app.edit("保留筛查期间的草稿");
   app.get("openFilterButton").click();
   for (const key of ["d", "D", "e", "E", "q", "w", "ArrowLeft", "ArrowRight"]) {
@@ -843,7 +949,7 @@ test("the filter dialog blocks deletion, saving, and navigation shortcuts even f
 });
 
 test("saving annotations refreshes attribute matches and advances when the saved image no longer matches", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("a.jpg", { food_name: "包子" }),
     annotatedImage("b.jpg", { food_name: "包子" }),
     annotatedImage("c.jpg", { food_name: "鸡蛋" })
@@ -868,7 +974,7 @@ test("saving annotations refreshes attribute matches and advances when the saved
 });
 
 test("live image updates obey applied filters and select a new matching image after the old match changes", async () => {
-  const app = await createApp([
+  const app = await createSelectedApp([
     annotatedImage("a.jpg", { food_name: "包子" }),
     annotatedImage("b.jpg", { food_name: "鸡蛋" })
   ]);

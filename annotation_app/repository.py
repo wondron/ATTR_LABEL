@@ -13,9 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any
-
 from pydantic import ValidationError
-
 from .config import ANNOTATION_VERSION, IMAGE_SUFFIXES, MISSING_REVISION
 from .models import AnnotationDocument, AnnotationValues
 
