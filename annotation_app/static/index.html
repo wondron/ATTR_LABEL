@@ -200,6 +200,16 @@
                 <small class="field-error" id="qualityError"></small>
               </label>
 
+              <label class="field" for="waterQualityInput">
+                <span class="field-label">
+                  <span class="field-name"><b>含水质量（g）</b><code>water_quality</code></span>
+                  <span class="json-type" data-json-type="water_quality" title="默认 null">float | null</span>
+                </span>
+                <input id="waterQualityInput" name="water_quality" type="number" step="any" inputmode="decimal" placeholder="整数或小数" autocomplete="off" aria-describedby="waterQualityHelp waterQualityError">
+                <small class="field-help field-help--sr-only" id="waterQualityHelp">保存为浮点数；默认 <code data-json-default="water_quality">null</code></small>
+                <small class="field-error" id="waterQualityError"></small>
+              </label>
+
               <label class="field" for="foodSizeInput">
                 <span class="field-label">
                   <span class="field-name"><b>食物尺寸</b><code>food_size</code></span>
@@ -398,6 +408,6 @@
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="/static/app.js?v=annotation-filter-1" defer></script>
+  <script src="/static/app.js?v=water-quality-1" defer></script>
 </body>
 </html>

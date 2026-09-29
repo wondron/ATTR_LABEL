@@ -16,6 +16,7 @@ class AnnotationValues(BaseModel):
     food_name: str = "无"
     food_count: int | None = Field(default=None, ge=0)
     quality: float | None = None
+    water_quality: float | None = None
     device_model: str | None = None
     container_type: list[str] = Field(default_factory=lambda: ["无"])
     accessory_type: list[str] = Field(default_factory=lambda: ["无"])
@@ -109,12 +110,13 @@ class SaveAnnotationRequest(BaseModel):
         require_exact_type("device_model", str, "字符串", nullable=True)
         require_exact_type("food_size", int, "整数", nullable=True)
 
-        if "quality" in annotations and annotations["quality"] is not None:
-            quality = annotations["quality"]
+        for field_name in ("quality", "water_quality"):
+            if field_name not in annotations or annotations[field_name] is None:
+                continue
             # JSON/JavaScript 不保留 215 与 215.0 的语义差异；后续规范化会
             # 始终转为 Python float，并由后端以 215.0 的形式落盘。
-            if type(quality) not in {int, float}:
-                raise ValueError("quality 必须是数字或 null。")
+            if type(annotations[field_name]) not in {int, float}:
+                raise ValueError(f"{field_name} 必须是数字或 null。")
 
         for field_name in ("container_type", "accessory_type", "rack_level"):
             if field_name not in annotations:

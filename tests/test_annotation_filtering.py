@@ -67,6 +67,7 @@ class AnnotationFilteringTests(unittest.TestCase):
                 "food_name": "包子",
                 "food_count": 0,
                 "quality": 123.5,
+                "water_quality": None,
                 "device_model": None,
                 "container_type": ["铝箔纸"],
                 "accessory_type": ["无"],
@@ -147,10 +148,20 @@ class AnnotationFilteringTests(unittest.TestCase):
                 params={"image_id": "unlabeled.jpg", "directory_generation": 0},
                 json={
                     "revision": MISSING_REVISION,
-                    "annotations": {"food_name": "面包", "food_count": 0},
+                    "annotations": {"food_name": "面包", "food_count": 0, "water_quality": 25.5},
                 },
             )
             self.assertEqual(saved.status_code, 200, saved.text)
+            stored = json.loads((self.root / "unlabeled.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["annotations"]["water_quality"], 25.5)
+            fields = list(stored["annotations"])
+            self.assertEqual(fields[fields.index("quality") + 1], "water_quality")
+            loaded = client.get(
+                "/api/v1/annotation",
+                params={"image_id": "unlabeled.jpg", "directory_generation": 0},
+            )
+            self.assertEqual(loaded.status_code, 200, loaded.text)
+            self.assertEqual(loaded.json()["annotation"]["annotations"]["water_quality"], 25.5)
             response = client.get(
                 "/api/v1/images",
                 params={"directory_generation": 0, "status": "labeled", "search": "unlabeled"},

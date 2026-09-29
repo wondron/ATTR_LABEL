@@ -755,9 +755,51 @@ async function applyAnnotationFilter(app) {
   await flush();
 }
 
+test("water quality loads legacy defaults, tracks edits, and saves decimals, zero, and cleared values", async () => {
+  const app = await createSelectedApp([
+    annotatedImage("legacy.jpg", { food_name: "包子", quality: 125.5 }),
+    annotatedImage("saved.jpg", { food_name: "鸡蛋", quality: 200, water_quality: 90.25 })
+  ]);
+  const input = app.get("waterQualityInput");
+  assert.equal(input.value, "");
+  assert.equal(app.get("qualityInput").value, "125.5");
+  for (const [value, expected] of [["42.75", 42.75], ["0", 0], ["", null]]) {
+    input.value = value;
+    input.dispatchEvent({ type: "input" });
+    const leave = { type: "beforeunload", bubbles: false };
+    app.window.dispatchEvent(leave);
+    assert.equal(leave.defaultPrevented, true, "water quality edits must be protected from accidental navigation");
+    app.get("saveButton").click();
+    await flush();
+    const saved = JSON.parse(app.requests.findLast((request) => request.method === "PUT").options.body).annotations;
+    assert.equal(saved.water_quality, expected);
+    assert.equal(saved.quality, 125.5);
+  }
+  await app.select("saved.jpg");
+  assert.equal(input.value, "90.25");
+});
+
+test("invalid water quality prevents saving and clearing it removes the validation error", async () => {
+  const app = await createSelectedApp();
+  const input = app.get("waterQualityInput");
+  input.value = "Infinity";
+  input.dispatchEvent({ type: "input" });
+  app.get("saveButton").click();
+  await flush();
+  assert.equal(app.requests.filter((request) => request.method === "PUT").length, 0);
+  assert.match(app.get("waterQualityError").textContent, /含水质量必须是数字/);
+  assert.equal(app.document.activeElement, input);
+  input.value = "";
+  input.dispatchEvent({ type: "input" });
+  app.get("saveButton").click();
+  await flush();
+  assert.equal(app.get("waterQualityError").textContent, "");
+  assert.equal(app.requests.filter((request) => request.method === "PUT").length, 1);
+});
+
 test("attribute defaults include unannotated and missing fields, distinguish zero, and exclude invalid JSON", async () => {
   const defaults = {
-    food_name: "无", food_count: null, quality: null, device_model: null,
+    food_name: "无", food_count: null, quality: null, water_quality: null, device_model: null,
     container_type: ["无"], accessory_type: ["无"], rack_level: ["无"], food_size: null
   };
   const app = await createSelectedApp([
@@ -796,9 +838,9 @@ test("configured defaults apply equally to missing fields and unannotated images
   assert.deepEqual(app.visible(), ["new.jpg", "missing-count.jpg", "two.jpg"]);
 });
 
-test("all eight attribute filters combine with AND, checkbox choices use OR, and filename/status filters remain active", async () => {
+test("all nine attribute filters combine with AND, checkbox choices use OR, and filename/status filters remain active", async () => {
   const matching = {
-    food_name: "蒸鸡蛋", food_count: 2, quality: 125.5, device_model: "C9277A", food_size: 4,
+    food_name: "蒸鸡蛋", food_count: 2, quality: 125.5, water_quality: 80.25, device_model: "C9277A", food_size: 4,
     container_type: ["金属容器"], accessory_type: ["烤盘"], rack_level: ["1", "2"]
   };
   const app = await createSelectedApp([
@@ -806,6 +848,7 @@ test("all eight attribute filters combine with AND, checkbox choices use OR, and
     annotatedImage("alpha-2.jpg", { ...matching, container_type: ["陶瓷容器"] }),
     annotatedImage("beta-1.jpg", matching),
     annotatedImage("alpha-wrong.jpg", { ...matching, device_model: "DB677" }),
+    annotatedImage("alpha-wrong-water.jpg", { ...matching, water_quality: 80 }),
     image("alpha-new.jpg")
   ]);
   app.get("imageSearch").value = "ALPHA";
@@ -816,6 +859,7 @@ test("all eight attribute filters combine with AND, checkbox choices use OR, and
   setAnnotationFilter(app, "food_name", "contains", "鸡蛋");
   setAnnotationFilter(app, "food_count", "value", "2");
   setAnnotationFilter(app, "quality", "value", "125.50");
+  setAnnotationFilter(app, "water_quality", "value", "80.250");
   setAnnotationFilter(app, "food_size", "value", "4");
   setAnnotationFilter(app, "device_model", "value", "C9277A");
   setAnnotationFilter(app, "container_type", "value", ["金属容器", "陶瓷容器"]);

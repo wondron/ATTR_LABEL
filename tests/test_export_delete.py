@@ -40,6 +40,7 @@ def save_example(repository: AnnotationRepository, image_id: str, name: str = "�
             food_name=name,
             food_count=2,
             quality=123.5,
+            water_quality=25.5,
             device_model="C9277A",
             container_type=["陶瓷容器", "油纸"],
             accessory_type=["烤盘"],
@@ -59,7 +60,7 @@ class ExportDeleteTests(unittest.TestCase):
     def client(self) -> TestClient:
         return TestClient(create_app(self.root, allowed_data_roots=(self.root.parent,)))
 
-    def test_zip_contains_only_labeled_originals_and_nine_typed_excel_columns(self) -> None:
+    def test_zip_contains_only_labeled_originals_and_ten_typed_excel_columns(self) -> None:
         for name in ("子目录/同名.jpg", "另一个目录/同名.jpg", "未标注.jpg", "=1+1.jpg"):
             make_image(self.root / name)
         repository = AnnotationRepository(self.root)
@@ -94,12 +95,14 @@ class ExportDeleteTests(unittest.TestCase):
         sheet = workbook.active
         self.assertEqual(tuple(cell.value for cell in sheet[1]), EXCEL_HEADERS)
         self.assertEqual(sheet.max_row, 4)
-        self.assertEqual(sheet.max_column, 9)
+        self.assertEqual(sheet.max_column, 10)
+        self.assertEqual(sheet.cell(1, 5).value, "含水质量")
+        self.assertEqual(sheet.auto_filter.ref, "A1:J4")
         for row in sheet.iter_rows(min_row=2):
             self.assertEqual(row[1].data_type, "s")
             self.assertTrue(row[1].value.startswith("=HYPERLINK"))
             self.assertEqual([cell.value for cell in row[2:]], [
-                2, 123.5, "C9277A", "陶瓷容器、油纸", "烤盘", "1、2", 8,
+                2, 123.5, 25.5, "C9277A", "陶瓷容器、油纸", "烤盘", "1、2", 8,
             ])
         with ZipFile(io.BytesIO(xlsx)) as contents:
             self.assertNotIn(b"<f>", contents.read("xl/worksheets/sheet1.xml"))

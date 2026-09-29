@@ -28,6 +28,7 @@ def sample_annotations(food_name: str = "包子") -> dict[str, object]:
         "food_name": food_name,
         "food_count": 2,
         "quality": 123.5,
+        "water_quality": 25.5,
         "device_model": "C9277A",
         "container_type": ["陶瓷容器"],
         "accessory_type": ["烤盘"],
@@ -74,7 +75,13 @@ class LinuxStatisticsTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(payload["directory_generation"], 0)
-                self.assertEqual(len(payload["fields"]), 8)
+                self.assertEqual(len(payload["fields"]), 9)
+                water_quality = next(
+                    field for field in payload["fields"] if field["name"] == "water_quality"
+                )
+                self.assertEqual(water_quality["label"], "含水质量（g）")
+                self.assertEqual(water_quality["values"][0]["value"], 25.5)
+                self.assertEqual(water_quality["values"][0]["count"], 1)
                 food_name = next(
                     field
                     for field in payload["fields"]

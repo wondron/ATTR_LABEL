@@ -19,7 +19,7 @@ from .watcher import DirectorySyncService
 
 
 EXCEL_HEADERS = (
-    "照片文件名", "食物名称", "食物数量", "总重量", "设备型号",
+    "照片文件名", "食物名称", "食物数量", "总重量", "含水质量", "设备型号",
     "容器类型", "附件类型", "层位", "食物尺寸",
 )
 
@@ -51,7 +51,7 @@ def _write_workbook(rows: list[list[Any]], path: Path) -> None:
     workbook = Workbook(write_only=True)
     sheet = workbook.create_sheet("已标注数据")
     sheet.freeze_panes = "B2"
-    widths = (42, 26, 14, 16, 18, 30, 30, 16, 16)
+    widths = (42, 26, 14, 16, 16, 18, 30, 30, 16, 16)
     for index, width in enumerate(widths):
         sheet.column_dimensions[chr(ord("A") + index)].width = width
     headers = [WriteOnlyCell(sheet, value=label) for label in EXCEL_HEADERS]
@@ -68,7 +68,7 @@ def _write_workbook(rows: list[list[Any]], path: Path) -> None:
                     cell.data_type = "s"
                 cells.append(cell)
             sheet.append(cells)
-        sheet.auto_filter.ref = f"A1:I{len(rows) + 1}"
+        sheet.auto_filter.ref = f"A1:J{len(rows) + 1}"
     finally:
         # write_only 工作表自身使用临时文件；save 会完成并释放这些文件。
         try:
@@ -110,7 +110,7 @@ def create_export_archive(
                     values = document.annotations
                     row = [
                         image_id, values.food_name, values.food_count, values.quality,
-                        values.device_model, values.container_type, values.accessory_type,
+                        values.water_quality, values.device_model, values.container_type, values.accessory_type,
                         values.rack_level, values.food_size,
                     ]
                     rows.append([_excel_value(value, image_id) for value in row])

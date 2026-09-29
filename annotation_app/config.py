@@ -85,6 +85,15 @@ FIELD_DEFINITIONS = (
         "default": None,
     },
     {
+        "name": "water_quality",
+        "label": "含水质量（g）",
+        "type": "number",
+        "json_type": "float | null",
+        "multiple": False,
+        "nullable": True,
+        "default": None,
+    },
+    {
         "name": "device_model",
         "label": "设备型号",
         "type": "select",

@@ -148,6 +148,7 @@
     foodName: byId("foodNameInput"),
     foodCount: byId("foodCountInput"),
     quality: byId("qualityInput"),
+    waterQuality: byId("waterQualityInput"),
     deviceModel: byId("deviceModelSelect"),
     containerChoices: byId("containerChoices"),
     accessoryChoices: byId("accessoryChoices"),
@@ -189,6 +190,7 @@
       food_name: "无",
       food_count: null,
       quality: null,
+      water_quality: null,
       device_model: null,
       container_type: ["无"],
       accessory_type: ["无"],
@@ -1747,14 +1749,15 @@
   function annotationFilterDefinitions() {
     const defaults = createEmptyAnnotations(state.config);
     const labels = {
-      food_name: "食物名称", food_count: "食物数量", quality: "总重量（g）",
+      food_name: "食物名称", food_count: "食物数量", quality: "总重量（g）", water_quality: "含水质量（g）",
       device_model: "设备型号", container_type: "容器类型", accessory_type: "附件类型",
       rack_level: "层位", food_size: "食物尺寸"
     };
     return Object.entries(labels).map(([name, label]) => ({
       name, label, default: defaults[name],
       multiple: Array.isArray(defaults[name]),
-      numeric: ["food_count", "quality", "food_size"].includes(name),
+      numeric: ["food_count", "quality", "water_quality", "food_size"].includes(name),
+      decimal: ["quality", "water_quality"].includes(name),
       options: state.options[name] || []
     }));
   }
@@ -1821,7 +1824,7 @@
           }
         } else {
           input.type = field.numeric ? "number" : "text";
-          input.step = field.name === "quality" ? "any" : "1";
+          input.step = field.decimal ? "any" : "1";
           if (field.name === "food_count") input.min = "0";
           if (field.name === "food_size") input.min = "1";
           input.placeholder = field.numeric ? "输入数值" : "输入食物名称";
@@ -1880,12 +1883,12 @@
         if (field.numeric) {
           const number = Number(value);
           const invalid = !Number.isFinite(number)
-            || (field.name !== "quality" && !Number.isInteger(number))
+            || (!field.decimal && !Number.isInteger(number))
             || (field.name === "food_count" && number < 0)
             || (field.name === "food_size" && number <= 0);
           if (invalid) {
             input.focus();
-            throw new Error(`请填写有效的${field.label}${field.name === "quality" ? "数值" : "整数"}。`);
+            throw new Error(`请填写有效的${field.label}${field.decimal ? "数值" : "整数"}。`);
           }
           filters[field.name] = { mode, value: number };
         } else {
@@ -2231,6 +2234,7 @@
     const rackValue = source.rack_level;
     const count = source.food_count;
     const quality = source.quality;
+    const waterQuality = source.water_quality;
     const deviceModel = source.device_model;
     let foodName = source.food_name == null ? "无" : String(source.food_name).trim();
     if (!foodName) foodName = "无";
@@ -2242,6 +2246,7 @@
       food_name: foodName,
       food_count: count == null || count === "" || count === "无" ? "" : String(count).trim(),
       quality: quality == null || quality === "无" ? "" : String(quality).trim(),
+      water_quality: waterQuality == null || waterQuality === "无" ? "" : String(waterQuality).trim(),
       device_model: deviceModel == null || deviceModel === "" || deviceModel === "None"
         ? null
         : String(deviceModel).trim(),
@@ -2260,6 +2265,7 @@
     elements.foodName.value = state.draft.food_name;
     elements.foodCount.value = state.draft.food_count;
     elements.quality.value = state.draft.quality;
+    elements.waterQuality.value = state.draft.water_quality;
     renderDeviceModelOptions(state.draft.device_model);
     elements.foodSize.value = state.draft.food_size;
     renderAllChoiceGroups();
@@ -2325,6 +2331,7 @@
     state.draft.food_name = elements.foodName.value.trim();
     state.draft.food_count = elements.foodCount.value.trim();
     state.draft.quality = elements.quality.value.trim();
+    state.draft.water_quality = elements.waterQuality.value.trim();
     state.draft.device_model = elements.deviceModel.value || null;
     state.draft.container_type = selectedValues(elements.containerChoices);
     state.draft.accessory_type = selectedValues(elements.accessoryChoices);
@@ -2389,7 +2396,7 @@
   }
 
   function clearValidationErrors() {
-    const ids = ["foodNameError", "foodCountError", "qualityError", "deviceModelError", "containerTypeError", "accessoryTypeError", "rackLevelError", "foodSizeError"];
+    const ids = ["foodNameError", "foodCountError", "qualityError", "waterQualityError", "deviceModelError", "containerTypeError", "accessoryTypeError", "rackLevelError", "foodSizeError"];
     ids.forEach((id) => { byId(id).textContent = ""; });
     elements.form.querySelectorAll(".has-error").forEach((node) => node.classList.remove("has-error"));
     elements.form.querySelectorAll("[aria-invalid='true']").forEach((node) => {
@@ -2430,6 +2437,13 @@
       const quality = Number(state.draft.quality);
       if (!Number.isFinite(quality)) {
         firstInvalid = firstInvalid || setFieldError("qualityError", "总重量必须是数字。", elements.quality);
+      }
+    }
+
+    if (state.draft.water_quality !== "") {
+      const waterQuality = Number(state.draft.water_quality);
+      if (!Number.isFinite(waterQuality)) {
+        firstInvalid = firstInvalid || setFieldError("waterQualityError", "含水质量必须是数字。", elements.waterQuality);
       }
     }
 
@@ -2477,6 +2491,7 @@
       food_name: String(state.draft.food_name),
       food_count: nullableInteger(state.draft.food_count),
       quality: nullableFloat(state.draft.quality),
+      water_quality: nullableFloat(state.draft.water_quality),
       device_model: state.draft.device_model,
       container_type: state.draft.container_type.map(String),
       accessory_type: state.draft.accessory_type.map(String),
@@ -2786,7 +2801,7 @@
     elements.zoomOut.addEventListener("click", () => changeZoom(1 / 1.2));
     elements.zoomIn.addEventListener("click", () => changeZoom(1.2));
     elements.fitButton.addEventListener("click", fitImage);
-    for (const input of [elements.foodName, elements.foodCount, elements.quality, elements.foodSize]) {
+    for (const input of [elements.foodName, elements.foodCount, elements.quality, elements.waterQuality, elements.foodSize]) {
       input.addEventListener("input", () => {
         syncDraftFromForm();
         markDirty();

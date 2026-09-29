@@ -157,14 +157,14 @@ def _normalize_number(value: Any, field_name: str) -> int | float | None:
     return result
 
 
-def normalize_quality(value: Any) -> float | None:
+def normalize_quality(value: Any, field_name: str = "quality") -> float | None:
     """规范为 JSON 浮点数；旧版整数和数字字符串仍可读取。"""
-    number = _normalize_number(value, "quality")
+    number = _normalize_number(value, field_name)
     if number is None:
         return None
     result = float(number)
     if not math.isfinite(result):
-        raise ValueError("quality 超出可保存的数字范围。")
+        raise ValueError(f"{field_name} 超出可保存的数字范围。")
     return result
 
 
@@ -264,6 +264,7 @@ def normalize_annotations(raw: Mapping[str, Any]) -> dict[str, Any]:
         "food_name": food_name,
         "food_count": normalize_food_count(raw.get("food_count")),
         "quality": normalize_quality(raw.get("quality")),
+        "water_quality": normalize_quality(raw.get("water_quality"), "water_quality"),
         "device_model": normalize_device_model(raw.get("device_model")),
         "container_type": normalize_enum_list(
             raw.get("container_type"),
