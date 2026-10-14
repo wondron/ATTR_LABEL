@@ -42,7 +42,7 @@ def save_example(repository: AnnotationRepository, image_id: str, name: str = "�
             quality=123.5,
             water_quality=25.5,
             device_model="C9277A",
-            container_type=["陶瓷容器", "油纸"],
+            container_type=["陶瓷容器", "铝箔纸"],
             accessory_type=["烤盘"],
             rack_level=["1", "2"],
             food_size=8,
@@ -102,7 +102,7 @@ class ExportDeleteTests(unittest.TestCase):
             self.assertEqual(row[1].data_type, "s")
             self.assertTrue(row[1].value.startswith("=HYPERLINK"))
             self.assertEqual([cell.value for cell in row[2:]], [
-                2, 123.5, 25.5, "C9277A", "陶瓷容器、油纸", "烤盘", "1、2", 8,
+                2, 123.5, 25.5, "C9277A", "陶瓷容器、铝箔纸", "烤盘", "1、2", 8,
             ])
         with ZipFile(io.BytesIO(xlsx)) as contents:
             self.assertNotIn(b"<f>", contents.read("xl/worksheets/sheet1.xml"))
