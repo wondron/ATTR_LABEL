@@ -21,6 +21,7 @@ if [[ -r "${ENV_FILE}" ]]; then
   set +a
 fi
 
+STOP_WAIT_SECONDS="${STOP_WAIT_SECONDS:-20}"
 DATA_DIR="${1:-${LABEL_DATA_DIR:-10-temp_label}}"
 [[ "${DATA_DIR}" == /* ]] || DATA_DIR="${PROJECT_DIR}/${DATA_DIR}"
 LABEL_HOST="${LABEL_HOST:-0.0.0.0}"
@@ -28,6 +29,7 @@ LABEL_PORT="${LABEL_PORT:-8577}"
 
 [[ -d "${DATA_DIR}" ]] || die "数据目录不存在：${DATA_DIR}"
 [[ "${WAIT_SECONDS}" =~ ^[1-9][0-9]*$ ]] || die "WAIT_SECONDS 必须是正整数"
+[[ "${STOP_WAIT_SECONDS}" =~ ^[1-9][0-9]*$ ]] || die "STOP_WAIT_SECONDS 必须是正整数"
 [[ "${LABEL_PORT}" =~ ^[0-9]+$ && ${#LABEL_PORT} -le 5 ]] ||
   die "端口无效：${LABEL_PORT}"
 LABEL_PORT="$((10#${LABEL_PORT}))"
@@ -40,18 +42,64 @@ is_our_process() {
     grep -Fx -- "${PROJECT_DIR}/run_annotation_ui.py" >/dev/null 2>&1
 }
 
+process_start_time() {
+  local pid="$1" stat_line
+  local -a fields
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  IFS= read -r stat_line 2>/dev/null < "/proc/${pid}/stat" || return 1
+  # comm can contain spaces and closing parentheses; use the last ") ".
+  read -r -a fields <<< "${stat_line##*) }"
+  [[ ${#fields[@]} -ge 20 ]] || return 1
+  # A zombie is already dead even though its /proc entry still exists.
+  [[ "${fields[0]}" != Z && "${fields[0]}" != X && "${fields[0]}" != x ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+is_same_process() {
+  local current_start
+  current_start="$(process_start_time "$1")" || return 1
+  [[ "${current_start}" == "$2" ]]
+}
+
+wait_for_exit() {
+  local pid="$1" start_time="$2" timeout="$3"
+  local deadline=$((SECONDS + timeout))
+  while is_same_process "${pid}" "${start_time}"; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.5
+  done
+}
+
 if [[ -f "${PID_FILE}" ]]; then
   OLD_PID="$(tr -d '[:space:]' < "${PID_FILE}")"
-  if is_our_process "${OLD_PID}"; then
+  OLD_START_TIME="$(process_start_time "${OLD_PID}" || true)"
+  if [[ -n "${OLD_START_TIME}" ]]; then
+    is_our_process "${OLD_PID}" ||
+      die "PID 文件指向其他进程（${OLD_PID}），已停止操作"
     echo "停止旧进程：${OLD_PID}"
-    kill "${OLD_PID}" || die "无法停止旧进程 ${OLD_PID}"
-    for _ in {1..20}; do
-      [[ ! -e "/proc/${OLD_PID}" ]] && break
-      sleep 0.5
-    done
-    [[ ! -e "/proc/${OLD_PID}" ]] || die "旧进程 ${OLD_PID} 在 10 秒内没有退出"
-  elif [[ "${OLD_PID}" =~ ^[1-9][0-9]*$ && -e "/proc/${OLD_PID}" ]]; then
-    die "PID 文件指向其他进程（${OLD_PID}），已停止操作"
+    if ! kill -TERM "${OLD_PID}" 2>/dev/null; then
+      is_same_process "${OLD_PID}" "${OLD_START_TIME}" &&
+        die "无法停止旧进程 ${OLD_PID}"
+    fi
+    if ! wait_for_exit "${OLD_PID}" "${OLD_START_TIME}" "${STOP_WAIT_SECONDS}"; then
+      # Recheck ownership and start time before escalating, protecting reused PIDs.
+      if is_same_process "${OLD_PID}" "${OLD_START_TIME}"; then
+        is_our_process "${OLD_PID}" ||
+          die "旧进程身份已改变（${OLD_PID}），已停止操作"
+        echo "旧进程 ${OLD_PID} 在 ${STOP_WAIT_SECONDS} 秒内没有退出，发送 SIGKILL" >&2
+        if ! kill -KILL "${OLD_PID}" 2>/dev/null; then
+          is_same_process "${OLD_PID}" "${OLD_START_TIME}" &&
+            die "无法强制停止旧进程 ${OLD_PID}"
+        fi
+      fi
+      if ! wait_for_exit "${OLD_PID}" "${OLD_START_TIME}" 5; then
+        ps -o pid,ppid,stat,wchan:32,args -p "${OLD_PID}" >&2 || true
+        tail -n 40 "${LOG_FILE}" >&2 || true
+        die "旧进程 ${OLD_PID} 在 SIGKILL 后仍未退出，请检查上方进程状态及磁盘/NFS I/O"
+      fi
+    fi
+  elif [[ "${OLD_PID}" =~ ^[1-9][0-9]*$ && -e "/proc/${OLD_PID}" && ! -r "/proc/${OLD_PID}/stat" ]]; then
+    die "无法读取旧进程 ${OLD_PID} 的状态，已停止操作"
   fi
   rm -f -- "${PID_FILE}"
 fi

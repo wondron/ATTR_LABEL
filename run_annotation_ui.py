@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import socket
 import threading
 import webbrowser
 from pathlib import Path
@@ -16,6 +17,14 @@ from annotation_app import create_app
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8577
+
+
+class AnnotationServer(uvicorn.Server):
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        # Uvicorn drains HTTP connections before invoking the app lifespan.
+        # Wake the never-ending SSE responses before that drain begins.
+        self.config.app.state.shutdown_requested.set()
+        await super().shutdown(sockets=sockets)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -60,7 +69,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"标注界面：{url}")
     print(f"图像目录：{application.state.repository.data_dir}")
-    uvicorn.run(application, host=args.host, port=args.port)
+    server = AnnotationServer(
+        uvicorn.Config(
+            application,
+            host=args.host,
+            port=args.port,
+            timeout_graceful_shutdown=5,
+        )
+    )
+    server.run()
     return 0
 
 

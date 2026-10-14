@@ -426,6 +426,7 @@ def create_app(
         initial_repository.data_dir,
     )
     health_directory_sync = DirectorySyncService()
+    shutdown_requested = asyncio.Event()
     client_sessions: dict[str, ClientDirectorySession] = {}
     retired_client_sessions: dict[str, ClientDirectorySession] = {}
     client_sessions_lock = asyncio.Lock()
@@ -495,6 +496,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        shutdown_requested.clear()
         await health_directory_sync.start(
             initial_repository.data_dir,
             0,
@@ -507,6 +509,7 @@ def create_app(
         try:
             yield
         finally:
+            shutdown_requested.set()
             session_reaper.cancel()
             await asyncio.gather(session_reaper, return_exceptions=True)
             async with client_sessions_lock:
@@ -534,6 +537,7 @@ def create_app(
     app.state.directory_generation = 0
     app.state.allowed_data_roots = effective_allowed_roots
     app.state.directory_sync = health_directory_sync
+    app.state.shutdown_requested = shutdown_requested
     app.state.client_sessions = client_sessions
     app.state.data_mutation_lock = asyncio.Lock()
 
@@ -901,6 +905,8 @@ def create_app(
             subscriber_id, event_queue = directory_sync.subscribe(
                 current_generation
             )
+            shutdown_waiter = asyncio.create_task(shutdown_requested.wait())
+            change_waiter: asyncio.Task[DirectoryChange] | None = None
             try:
                 yield "retry: 2000\n" + encode_event(
                     "ready",
@@ -910,12 +916,19 @@ def create_app(
                         "directory_generation": current_generation,
                     },
                 )
-                while True:
-                    try:
-                        change: DirectoryChange = await asyncio.wait_for(
-                            event_queue.get(), timeout=15.0
-                        )
-                    except asyncio.TimeoutError:
+                while not shutdown_requested.is_set():
+                    change_waiter = asyncio.create_task(event_queue.get())
+                    done, _ = await asyncio.wait(
+                        (change_waiter, shutdown_waiter),
+                        timeout=15.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if shutdown_waiter in done:
+                        break
+                    if change_waiter not in done:
+                        change_waiter.cancel()
+                        await asyncio.gather(change_waiter, return_exceptions=True)
+                        change_waiter = None
                         if await request.is_disconnected():
                             break
                         yield encode_event(
@@ -930,6 +943,8 @@ def create_app(
                         )
                         continue
 
+                    change = change_waiter.result()
+                    change_waiter = None
                     event_name = {
                         "created": "image-created",
                         "modified": "image-modified",
@@ -944,9 +959,17 @@ def create_app(
                     if change.kind == "directory-changed":
                         break
             finally:
-                directory_sync.unsubscribe(subscriber_id)
-                client_session.active_streams -= 1
-                client_session.touch()
+                waiters: list[asyncio.Task[Any]] = [shutdown_waiter]
+                if change_waiter is not None:
+                    waiters.append(change_waiter)
+                for waiter in waiters:
+                    waiter.cancel()
+                try:
+                    await asyncio.gather(*waiters, return_exceptions=True)
+                finally:
+                    directory_sync.unsubscribe(subscriber_id)
+                    client_session.active_streams -= 1
+                    client_session.touch()
 
         return StreamingResponse(
             stream_events(),

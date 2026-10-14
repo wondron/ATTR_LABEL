@@ -226,6 +226,7 @@ http://<服务器IP>:<LABEL_PORT>/
 | `LABEL_PORT` | `8577` | 服务端口 |
 | `LABEL_ALLOWED_DATA_ROOTS` | 空（仅初始目录） | 网页允许切换的数据根目录；多个路径用 `:` 分隔。不要设置为 `/` |
 | `WAIT_SECONDS` | `20` | `restart.sh` 等待健康接口的最长秒数 |
+| `STOP_WAIT_SECONDS` | `20` | 重启时等待旧进程正常退出的秒数，超时后核对身份并强制停止 |
 
 也可以绕过启动脚本直接运行：
 
@@ -247,6 +248,10 @@ cd /项目实际路径/label_mulAtti
 ```
 
 `restart.sh` 会安全核对 `annotation.pid` 指向的进程，停止旧实例，再使用 `nohup` 启动新实例。退出当前 SSH 或终端后服务仍会继续运行；但服务器重启或进程异常退出后，`nohup` 不会自动恢复。
+
+重启时先发送 `SIGTERM`，默认等待 20 秒（可在 `.env` 中设置 `STOP_WAIT_SECONDS`），超时后重新核对脚本路径和进程启动时间，再向同一个旧实例发送 `SIGKILL`，最多再等 5 秒。强制停止会中断正在处理的请求，重启前请保存标注并等下载完成。僵尸进程（状态 `Z`）已退出，不会因 `/proc/PID` 仍存在而阻止重启；真正无法退出时，脚本会保留 PID 文件并显示进程状态及最近日志。
+
+服务关闭时会主动结束网页的 SSE 实时更新连接，并为其他 HTTP 请求设置 5 秒的退出宽限。旧版本可能在端口已释放后仍等待 SSE 连接，因此 `lsof -i:8577` 没有输出也不代表 Python 进程已退出。遇到旧版本的“10 秒内没有退出”时，可查看 `ps -o pid,ppid,stat,wchan:32,args -p "$(cat annotation.pid)"` 和 `tail -n 40 annotation.log`；日志中的 `Waiting for connections to close` 表示仍在等待连接结束。更新重启脚本及服务代码后，直接再执行 `bash restart.sh` 即可停止卡住的旧实例并启动修复后的服务。
 
 查看进程、健康状态和实时日志：
 
