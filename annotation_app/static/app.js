@@ -2308,11 +2308,13 @@
 
   function handleChoiceChange(container, changed) {
     const checkboxes = Array.from(container.querySelectorAll("input[type='checkbox']"));
-    if (changed.checked && changed.value === "无") {
+    const exclusiveValues = container === elements.accessoryChoices ? ["无", "遮挡"] : ["无"];
+    if (changed.checked && exclusiveValues.includes(changed.value)) {
       checkboxes.forEach((checkbox) => { if (checkbox !== changed) checkbox.checked = false; });
     } else if (changed.checked) {
-      const none = checkboxes.find((checkbox) => checkbox.value === "无");
-      if (none) none.checked = false;
+      checkboxes.forEach((checkbox) => {
+        if (exclusiveValues.includes(checkbox.value)) checkbox.checked = false;
+      });
     }
     if (!checkboxes.some((checkbox) => checkbox.checked)) {
       const none = checkboxes.find((checkbox) => checkbox.value === "无");
