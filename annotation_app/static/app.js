@@ -1784,6 +1784,9 @@
         ["default", `默认值（${filterDefaultLabel(field.default)}）`],
         ["value", field.multiple ? "包含任一所选值" : "等于指定值"]
       ];
+      if (["food_name", "device_model"].includes(field.name)) {
+        modes.push(["filled", "已填写（非空且非“无”）"]);
+      }
       if (field.name === "food_name") modes.push(["contains", "包含关键词"]);
       for (const [value, text] of modes) {
         const option = document.createElement("option");
@@ -1866,7 +1869,7 @@
     for (const field of annotationFilterDefinitions()) {
       const mode = byId(`annotationFilterMode_${field.name}`).value;
       if (mode === "all") continue;
-      if (mode === "default") {
+      if (mode === "default" || mode === "filled") {
         filters[field.name] = { mode };
       } else if (field.multiple) {
         const values = Array.from(byId(`annotationFilterChoices_${field.name}`)
@@ -1906,6 +1909,10 @@
     const annotations = { ...defaults, ...(item.annotations || {}) };
     return Object.entries(filters).every(([name, condition]) => {
       const value = annotations[name];
+      if (condition.mode === "filled") {
+        const text = value == null ? "" : String(value).trim();
+        return text !== "" && text !== "无";
+      }
       if (condition.mode === "default") {
         const fallback = defaults[name];
         if (Array.isArray(fallback)) {
@@ -1949,6 +1956,7 @@
       .map((field) => {
         const condition = state.annotationFilters[field.name];
         return `${field.label}：${condition.mode === "default" ? filterDefaultLabel(field.default)
+          : condition.mode === "filled" ? "已填写（非空且非“无”）"
           : condition.values ? condition.values.join(" / ") : condition.value}`;
       }).join("；");
   }
