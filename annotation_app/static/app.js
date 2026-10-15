@@ -48,6 +48,7 @@
     switchingFolder: false,
     browsingFolder: false,
     statisticsLoading: false,
+    statisticsPending: false,
     statisticsSequence: 0,
     directoryGeneration: null,
     directorySwitchGeneration: null,
@@ -443,7 +444,7 @@
       if (!state.rootPath) setRootPath("10-temp_label");
       showToast("配置读取失败", `${error.message}；已使用内置枚举。`, "warning", 6500);
     } finally {
-      // 统计只依赖当前目录配置，无需等待完整图片列表扫描结束。
+      // 配置就绪后更新控件；统计范围随列表筛选结果更新。
       updateControls();
     }
   }
@@ -988,7 +989,6 @@
           const fallback = state.filteredImages[Math.max(0, Math.min(index, state.filteredImages.length - 1))];
           await selectImage(nextId || fallback.id, { skipPrompt: true });
         }
-        if (elements.statisticsDialog.open) loadStatistics();
         scheduleSilentImageSync({ delay: 0, autoSelectFirst: true });
       }
     }
@@ -1233,6 +1233,7 @@
     state.loadingAnnotation = false;
     state.saving = false;
     state.statisticsLoading = false;
+    state.statisticsPending = false;
     state.statisticsSequence += 1;
     state.directoryGeneration = directoryGeneration;
     state.directoryStale = false;
@@ -1523,7 +1524,7 @@
     elements.statisticsValidCount.textContent = String(valid);
     elements.statisticsLabeledDetail.textContent = `共 ${labeled} 份已保存 JSON`;
     elements.statisticsCoverage.textContent = formatPercentage(coverage);
-    elements.statisticsTotalDetail.textContent = `共 ${total} 张图像`;
+    elements.statisticsTotalDetail.textContent = `筛选范围共 ${total} 张图像`;
     elements.statisticsUnlabeledCount.textContent = String(unlabeled);
     elements.statisticsInvalidCount.textContent = String(invalid);
     elements.statisticsOverview.hidden = false;
@@ -1664,10 +1665,12 @@
       elements.statisticsContext.hidden = true;
       renderStatisticsMessage(
         "empty",
-        "还没有可统计的有效标注",
-        summary.invalid
-          ? "请先修复异常 JSON，或继续完成并保存标注。"
-          : "完成并保存标注后，这里会展示八项属性的值分布。",
+        summary.total ? "当前筛选结果中没有有效标注" : "当前筛选结果为空",
+        !summary.total
+          ? "请调整文件名、标注状态或数据筛查条件后重试。"
+          : summary.invalid
+            ? "请先修复异常 JSON，或继续完成并保存标注。"
+            : "请完成并保存标注，或调整筛选条件。",
         false
       );
       return;
@@ -1692,13 +1695,22 @@
   }
 
   async function loadStatistics() {
-    if (state.statisticsLoading || state.directoryStale || state.directoryGeneration == null) return;
+    if (state.directoryStale || state.switchingFolder || state.directoryGeneration == null) return;
+    if (state.statisticsLoading) {
+      state.statisticsPending = true;
+      return;
+    }
+    state.statisticsPending = false;
     const sequence = ++state.statisticsSequence;
     const requestedGeneration = state.directoryGeneration;
+    const imageIds = state.filteredImages.map((item) => imageKey(item.id));
     setStatisticsBusy(true);
     renderStatisticsLoading();
     try {
-      const payload = await apiRequest(withDirectoryGeneration("/statistics"));
+      const payload = await apiRequest(withDirectoryGeneration("/statistics"), {
+        method: "POST",
+        body: JSON.stringify({ image_ids: imageIds })
+      });
       const responseGeneration = parseDirectoryGeneration(payload);
       if (
         sequence !== state.statisticsSequence
@@ -1712,6 +1724,7 @@
         markDirectoryStale(payload);
         return;
       }
+      if (state.statisticsPending) return;
       renderStatistics(payload || {});
       setServiceStatus("online", "服务正常");
     } catch (error) {
@@ -1722,11 +1735,17 @@
       if (isDirectoryChangedError(error)) {
         markDirectoryStale(error.payload && error.payload.detail);
       }
+      if (state.statisticsPending && !state.directoryStale) return;
       elements.statisticsOverview.hidden = true;
       elements.statisticsContext.hidden = true;
       renderStatisticsMessage("error", "统计加载失败", error.message, !state.directoryStale);
     } finally {
-      if (sequence === state.statisticsSequence) setStatisticsBusy(false);
+      if (sequence === state.statisticsSequence) {
+        const refreshPending = state.statisticsPending;
+        state.statisticsPending = false;
+        setStatisticsBusy(false);
+        if (refreshPending && elements.statisticsDialog.open) loadStatistics();
+      }
     }
   }
 
@@ -1998,6 +2017,7 @@
     updateAnnotationFilterSummary();
     renderImageList();
     updateNavigation();
+    if (elements.statisticsDialog.open) loadStatistics();
   }
 
   function renderImageList() {
@@ -2675,7 +2695,7 @@
         ? "正在切换数据目录…"
         : state.directoryStale
           ? "数据目录已切换，请重新选择文件夹或刷新页面"
-          : "查看当前文件夹的属性值分布";
+          : "查看当前筛选结果的属性值分布";
     elements.refreshStatisticsButton.disabled = state.statisticsLoading || state.switchingFolder || state.directoryStale;
     elements.chooseDataDirButton.disabled = state.switchingFolder || state.browsingFolder || state.loadingAnnotation || state.saving || state.deleting || state.downloading;
     elements.search.disabled = state.deleting || state.switchingFolder || state.directoryStale;
@@ -2755,6 +2775,7 @@
       if (outside) closeStatistics();
     });
     elements.statisticsDialog.addEventListener("close", () => {
+      state.statisticsPending = false;
       document.body.classList.remove("dialog-open");
     });
     elements.chooseDataDirButton.addEventListener("click", openDataDirectoryDialog);

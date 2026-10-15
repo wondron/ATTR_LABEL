@@ -222,7 +222,13 @@ async function createApp(initial = [image("第一张.jpg"), image("第二张.jpg
       server.images = server.images.filter((item) => item.id !== request.params.get("image_id"));
       return response({ image_exists: false, annotation_exists: false, directory_generation: 0 });
     }
-    if (request.path.endsWith("/statistics")) return response({ directory_generation: 0, summary: { ...listPayload(server.images).summary, valid: 0 }, fields: [] });
+    if (request.path.endsWith("/statistics")) {
+      const ids = request.method === "POST" ? new Set(JSON.parse(request.options.body).image_ids) : null;
+      const items = ids ? server.images.filter((item) => ids.has(item.id)) : server.images;
+      const summary = listPayload(items).summary;
+      summary.invalid = items.filter((item) => item.annotation_valid === false).length;
+      return response({ directory_generation: 0, summary: { ...summary, valid: summary.labeled - summary.invalid }, fields: [] });
+    }
     throw new Error(`Unexpected request: ${request.method} ${request.path}`);
   };
   const window = new Element("window");
@@ -754,6 +760,97 @@ async function applyAnnotationFilter(app) {
   app.get("annotationFilterForm").dispatchEvent({ type: "submit" });
   await flush();
 }
+
+test("statistics use the applied attribute, filename, and status filter intersection", async () => {
+  const app = await createApp([
+    annotatedImage("alpha-a.jpg", { food_name: "包子", device_model: "C9277A" }),
+    annotatedImage("alpha-b.jpg", { food_name: "无", device_model: "C9277A" }),
+    annotatedImage("alpha-c.jpg", { food_name: "鸡蛋", device_model: "DB677" }),
+    annotatedImage("beta-a.jpg", { food_name: "包子", device_model: "C9277A" }),
+    image("alpha-new.jpg")
+  ]);
+  app.get("imageSearch").value = "alpha";
+  app.get("imageSearch").dispatchEvent({ type: "input" });
+  app.get("statusFilter").value = "labeled";
+  app.get("statusFilter").dispatchEvent({ type: "change" });
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "filled");
+  setAnnotationFilter(app, "device_model", "value", "C9277A");
+  await applyAnnotationFilter(app);
+  app.get("openStatisticsButton").click();
+  await flush();
+  const request = app.requests.findLast((request) => request.path.endsWith("/statistics"));
+  assert.equal(request.method, "POST");
+  assert.equal(request.params.get("directory_generation"), "0");
+  assert.deepEqual(JSON.parse(request.options.body).image_ids, ["alpha-a.jpg"]);
+  assert.equal(app.get("statisticsTotalDetail").textContent, "筛选范围共 1 张图像");
+  assert.equal(app.get("statisticsValidCount").textContent, "1");
+  assert.equal(app.get("statisticsCoverage").textContent, "100%");
+  app.get("closeStatisticsButton").click();
+  app.get("clearAnnotationFilterButton").click();
+  await flush();
+  app.get("openStatisticsButton").click();
+  await flush();
+  assert.equal(app.get("statisticsTotalDetail").textContent, "筛选范围共 3 张图像");
+  app.get("closeStatisticsButton").click();
+  app.get("imageSearch").value = "";
+  app.get("imageSearch").dispatchEvent({ type: "input" });
+  app.get("statusFilter").value = "all";
+  app.get("statusFilter").dispatchEvent({ type: "change" });
+  app.get("openStatisticsButton").click();
+  await flush();
+  assert.equal(app.get("statisticsTotalDetail").textContent, "筛选范围共 5 张图像");
+  assert.equal(app.get("statisticsCoverage").textContent, "80%");
+});
+
+test("an empty filter result sends an empty statistics scope and displays zero totals", async () => {
+  const app = await createApp([annotatedImage("a.jpg", { food_name: "包子" })]);
+  app.get("imageSearch").value = "missing";
+  app.get("imageSearch").dispatchEvent({ type: "input" });
+  app.get("openStatisticsButton").click();
+  await flush();
+  const request = app.requests.findLast((request) => request.path.endsWith("/statistics"));
+  assert.deepEqual(JSON.parse(request.options.body).image_ids, []);
+  assert.equal(app.get("statisticsTotalDetail").textContent, "筛选范围共 0 张图像");
+  assert.equal(app.get("statisticsValidCount").textContent, "0");
+  assert.equal(app.get("statisticsCoverage").textContent, "0%");
+  assert.match(app.get("statisticsContent").textContent, /当前筛选结果为空/);
+});
+
+test("statistics discard an outdated response and coalesce live updates into the latest scope", async () => {
+  const app = await createApp([
+    annotatedImage("a.jpg", { food_name: "包子" }),
+    annotatedImage("b.jpg", { food_name: "无" }),
+    annotatedImage("c.jpg", { food_name: "无" })
+  ]);
+  app.get("openFilterButton").click();
+  setAnnotationFilter(app, "food_name", "filled");
+  await applyAnnotationFilter(app);
+  const first = deferred();
+  const second = deferred();
+  let calls = 0;
+  app.server.handler = (request) => request.path.endsWith("/statistics")
+    ? (++calls === 1 ? first.promise : second.promise) : undefined;
+  app.get("openStatisticsButton").click();
+  await flush();
+  app.server.images[0].annotations.food_name = "无";
+  app.server.images[1].annotations.food_name = "包子";
+  app.server.images[2].annotations.food_name = "鸡蛋";
+  await app.sync();
+  await app.sync();
+  assert.equal(calls, 1, "live updates must not start concurrent statistics requests");
+  first.resolve(response({ directory_generation: 0, summary: { total: 1, labeled: 1, valid: 1 }, fields: [] }));
+  await flush();
+  assert.equal(calls, 2);
+  assert.equal(app.get("statisticsOverview").hidden, true, "outdated totals must not be displayed");
+  const request = app.requests.findLast((request) => request.path.endsWith("/statistics"));
+  assert.deepEqual(JSON.parse(request.options.body).image_ids, ["b.jpg", "c.jpg"]);
+  second.resolve(response({ directory_generation: 0, summary: { total: 2, labeled: 2, valid: 2 }, fields: [] }));
+  await flush();
+  assert.equal(app.get("statisticsTotalDetail").textContent, "筛选范围共 2 张图像");
+  assert.equal(app.get("statisticsValidCount").textContent, "2");
+  assert.equal(app.get("statisticsContent").getAttribute("aria-busy"), "false");
+});
 
 test("water quality loads legacy defaults, tracks edits, and saves decimals, zero, and cleared values", async () => {
   const app = await createSelectedApp([

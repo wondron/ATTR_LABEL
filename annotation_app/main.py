@@ -28,7 +28,11 @@ from .config import (
     FIELD_DEFINITIONS,
     STATIC_DIR,
 )
-from .models import SaveAnnotationRequest, SelectDataDirectoryRequest
+from .models import (
+    SaveAnnotationRequest,
+    SelectDataDirectoryRequest,
+    StatisticsScopeRequest,
+)
 from .export import ExportArchive, NoAnnotatedDataError, create_export_archive
 from .repository import (
     AnnotationRepository,
@@ -981,10 +985,10 @@ def create_app(
             },
         )
 
-    @app.get("/api/v1/statistics")
-    async def get_statistics(
+    async def statistics_for_scope(
         http_request: Request,
-        directory_generation: int | None = Query(default=None, ge=0),
+        directory_generation: int | None,
+        image_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         client_session = client_session_for_request(http_request)
         current_repository, current_generation = repository_for_generation(
@@ -993,6 +997,13 @@ def create_app(
         )
         directory_sync = client_session.directory_sync
         snapshot = directory_sync.ready_snapshot(current_generation)
+        if image_ids is not None:
+            selected_ids = set(image_ids)
+            snapshot = {
+                image_id: record
+                for image_id, record in snapshot.items()
+                if image_id in selected_ids
+            }
 
         def collect_statistics() -> dict[str, Any]:
             summary, documents = current_repository.collect_annotation_documents(_ready_image_paths(snapshot))
@@ -1010,6 +1021,23 @@ def create_app(
 
         payload["directory_generation"] = current_generation
         return payload
+
+    @app.get("/api/v1/statistics")
+    async def get_statistics(
+        http_request: Request,
+        directory_generation: int | None = Query(default=None, ge=0),
+    ) -> dict[str, Any]:
+        return await statistics_for_scope(http_request, directory_generation)
+
+    @app.post("/api/v1/statistics")
+    async def get_filtered_statistics(
+        http_request: Request,
+        scope: StatisticsScopeRequest,
+        directory_generation: int = Query(ge=0),
+    ) -> dict[str, Any]:
+        return await statistics_for_scope(
+            http_request, directory_generation, scope.image_ids
+        )
 
     @app.get("/api/v1/export")
     async def export_annotations(

@@ -44,6 +44,14 @@ class AnnotationDocument(BaseModel):
     annotations: AnnotationValues
 
 
+class StatisticsScopeRequest(BaseModel):
+    """按浏览器筛选结果中的图片 ID 汇总已保存标注。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_ids: list[str]
+
+
 class SelectDataDirectoryRequest(BaseModel):
     """浏览器提交的服务器端标注数据目录。"""
 

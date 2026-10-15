@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import stat
@@ -38,6 +39,71 @@ def sample_annotations(food_name: str = "包子") -> dict[str, object]:
 
 
 class LinuxStatisticsTests(unittest.TestCase):
+    def test_filtered_statistics_use_selected_ids_for_totals_and_distributions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary).resolve()
+            for name in ("a.jpg", "b.jpg", "nested/a.jpg", "unlabeled.jpg", "broken.jpg"):
+                image_path = data_dir / name
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8), "red").save(image_path)
+            for name, food_name, count in (
+                ("a.json", "包子", 2),
+                ("b.json", "鸡蛋", 3),
+                ("nested/a.json", "包子", 0),
+            ):
+                annotations = {**sample_annotations(food_name), "food_count": count}
+                (data_dir / name).write_text(
+                    json.dumps({"annotations": annotations}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            (data_dir / "broken.json").write_text("{invalid", encoding="utf-8")
+
+            with TestClient(create_app(data_dir)) as client:
+                response = client.post(
+                    "/api/v1/statistics",
+                    params={"directory_generation": 0},
+                    json={"image_ids": [
+                        "a.jpg", "nested/a.jpg", "unlabeled.jpg", "broken.jpg",
+                        "a.jpg", "missing.jpg", "../outside.jpg",
+                    ]},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["summary"], {
+                    "total": 4, "labeled": 3, "valid": 2,
+                    "unlabeled": 1, "invalid": 1,
+                })
+                fields = {field["name"]: field for field in payload["fields"]}
+                self.assertEqual(fields["food_name"]["values"], [{
+                    "value": "包子", "label": "包子", "count": 2,
+                    "percentage": 100.0, "is_missing": False,
+                }])
+                self.assertEqual(
+                    {item["value"]: (item["count"], item["percentage"])
+                     for item in fields["food_count"]["values"] if item["count"]},
+                    {0: (1, 50.0), 2: (1, 50.0)},
+                )
+
+                empty = client.post(
+                    "/api/v1/statistics",
+                    params={"directory_generation": 0},
+                    json={"image_ids": []},
+                )
+                self.assertEqual(empty.status_code, 200, empty.text)
+                self.assertTrue(all(value == 0 for value in empty.json()["summary"].values()))
+                self.assertTrue(all(field["valid_annotations"] == 0 for field in empty.json()["fields"]))
+
+                missing_scope = client.post(
+                    "/api/v1/statistics", params={"directory_generation": 0}, json={}
+                )
+                self.assertEqual(missing_scope.status_code, 422)
+                stale = client.post(
+                    "/api/v1/statistics", params={"directory_generation": 1},
+                    json={"image_ids": ["a.jpg"]},
+                )
+                self.assertEqual(stale.status_code, 409, stale.text)
+                self.assertEqual(stale.json()["detail"]["code"], "data_directory_changed")
+
     def test_statistics_and_frontend_realtime_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary).resolve()
